@@ -10,12 +10,13 @@
   box-sizing: border-box;
 }
 body{
+  margin:0;
   font-family: "DotGothic16", sans-serif;
   font-weight: 400;
   font-style: normal;
   background: black;
   color: white;
-  margin: 16px;
+  
   line-height: 1.6;
 }
 .hidden-input {
@@ -104,7 +105,11 @@ body{
   border-radius: 50%;
   display: inline-block;
 }
-
+.main{
+  width:100vw;
+  display:flex;justify-content:center;
+  text-align:center;
+}
 canvas{
   
   
@@ -144,9 +149,9 @@ h1.title-main {
       </ul>
   </nav>
 </header>
-
+<div class="main">
   <canvas id="c" width="320" height="224"></canvas>
-  
+  </div>
   
     
    
