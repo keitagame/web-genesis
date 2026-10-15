@@ -107,9 +107,9 @@ body{
 
 canvas{
   
+  
+  
   width:60%;
-  
-  
   border: 1px solid #333;
   margin-top: 10px;
   image-rendering: pixelated;
@@ -136,9 +136,9 @@ h1.title-main {
   <header>
   <nav>
     <ul class="nav-list">
-      <li><input type="file" id="rom" accept=".bin,.md,.gen,.smd"></li>
+      <li><label class="upload-label"><input type="file" id="rom" class="hidden-input" accept=".bin,.md,.gen,.smd">genを選択</label></li>
       
-      <li><button id="rst">リセット</button></li>
+      <li><button class="button" id="rst">リセット</button></li>
      
       
       </ul>
@@ -1914,6 +1914,7 @@ class Z80 {
       this.iff = 0;
       this.iff2 = 0;
       this.halt = 0;
+      this.irq = 0;   // 受付で割り込み線を解除 (EI;RETI で同一フレーム内に再突入しない)
       this.push(this.pc);
       if (this.im === 2) {
         // IM2: データバスは0xFFとして (I<<8|0xFF) のベクタを参照
@@ -2670,7 +2671,7 @@ function pollPad() {
   bus.pad = kb & gp;
 }
 
-function frame() {
+function stepFrame() {
   pollPad();
   if (++fc % 120 === 0) bus.saveSram();
 
@@ -2685,6 +2686,24 @@ function frame() {
     }
     vdp.renderFrame();
     show();
+  }
+}
+
+// 60fps固定 (120/144Hzモニターでも倍速にならない)
+const FRAME_MS = 1000 / 60;
+let lastT = 0;
+let accT = 0;
+
+function frame(t) {
+  t = t || performance.now();
+  accT += Math.min(t - (lastT || t), 100);   // タブ復帰時の暴走防止
+  lastT = t;
+
+  let n = 0;
+  while (accT >= FRAME_MS - 1) {
+    accT -= FRAME_MS;
+    stepFrame();
+    if (++n >= 2) { accT = 0; break; }
   }
   requestAnimationFrame(frame);
 }
