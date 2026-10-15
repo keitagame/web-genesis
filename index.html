@@ -107,7 +107,7 @@ body{
 
 canvas{
   
-  
+  width:60%;
   
   
   border: 1px solid #333;
@@ -688,6 +688,11 @@ class Bus {
 // ==========================================
 const sx = (v, s) => (s === 0) ? (v << 24 >> 24) : (s === 1) ? (v << 16 >> 16) : (v | 0);
 
+// 命令実行中に発生する例外 (v = 例外ベクタ番号)
+class Fault {
+  constructor(v) { this.v = v; }
+}
+
 class M68K {
   constructor(bus) {
     this.bus = bus;
@@ -701,6 +706,8 @@ class M68K {
     this.em = 0;
     this.er = 0;
     this.ea = 0;
+    this.ipc = 0;
+    this.warned = 0;
   }
 
   reset() {
@@ -712,11 +719,14 @@ class M68K {
     this.irq = 0;
   }
 
+  // 不正命令: Illegal Instruction例外(ベクタ4)
   bad(op) {
-    throw new Error(
-      "未実装の命令 op=$" + (op & 0xFFFF).toString(16).toUpperCase() +
-      " PC=$" + (this.pc - 2).toString(16).toUpperCase()
-    );
+    throw new Fault(4);
+  }
+
+  // 特権命令: ユーザモードなら特権違反例外(ベクタ8)
+  priv() {
+    if (!(this.sr & 0x2000)) throw new Fault(8);
   }
 
   setSR(v) {
@@ -1007,6 +1017,49 @@ class M68K {
     this.cf(q & 0x8000, (q & 0xFFFF) === 0, 0, 0);
   }
 
+  // BCD演算 (sub=0: x+y+X / sub=1: x-y-X)。ABCD/SBCD/NBCD共通
+  bcd(sub, x, y) {
+    const X = (this.sr >> 4) & 1;
+    const ux = x & 255;
+    const uy = y & 255;
+    let t = sub ? (ux - uy - X) : (ux + uy + X);
+    let cr = 0;
+
+    if (sub) {
+      if ((ux & 15) - (uy & 15) - X < 0) t -= 6;
+      if (t < 0) { t -= 0x60; cr = 1; }
+    } else {
+      if ((ux & 15) + (uy & 15) + X > 9) t += 6;
+      if (t > 0x99) { t += 0x60; cr = 1; }
+    }
+    const v = sx(t & 255, 0);
+    this.sr = (this.sr & 0xFFE0) |
+              (cr ? 17 : 0) |
+              (v < 0 ? 8 : 0) |
+              ((this.sr & 4) && v === 0 ? 4 : 0);
+    return v;
+  }
+
+  // MOVEP: 1バイトおき(偶数/奇数アドレスのどちらか一方)でDnと転送
+  // op bit7-6: 00=Word mem->reg / 01=Long mem->reg / 10=Word reg->mem / 11=Long reg->mem
+  movep(op) {
+    const dn = (op >> 9) & 7;
+    const o = (op >> 6) & 3;
+    const n = (o & 1) ? 4 : 2;
+    const ad = this.a[op & 7] + this.fw();
+    const b = this.bus;
+    const d = this.d;
+
+    if (o < 2) {
+      let v = 0;
+      for (let i = 0; i < n; i++) v = (v << 8) | b.read8(ad + i * 2);
+      d[dn] = (n === 4) ? (v | 0) : ((d[dn] & ~65535) | (v & 65535));
+    } else {
+      const v = d[dn];
+      for (let i = 0; i < n; i++) b.write8(ad + i * 2, (v >> (8 * (n - 1 - i))) & 255);
+    }
+  }
+
   movem(op, dir) {
     const s = (op & 0x40) ? 2 : 1;
     const n = (s === 2) ? 4 : 2;
@@ -1067,6 +1120,23 @@ class M68K {
     }
     if (this.stopped) return 4;
 
+    this.ipc = this.pc;
+    try {
+      return this.run();
+    } catch (e) {
+      if (!(e instanceof Fault)) throw e;
+      if (e.v === 4 && this.warned < 8) {
+        this.warned++;
+        console.warn("不正命令 op=$" + (this.bus.read16(this.ipc) & 0xFFFF).toString(16).toUpperCase() +
+                     " PC=$" + this.ipc.toString(16).toUpperCase());
+      }
+      this.pc = this.ipc;
+      this.exc(e.v);
+      return 34;
+    }
+  }
+
+  run() {
     const op = this.fw() & 0xFFFF;
     const d = this.d;
     const a = this.a;
@@ -1078,11 +1148,12 @@ class M68K {
     switch (hi) {
       case 0: {
         if (op & 0x100) {
-          if (m === 1) this.bad(op);
+          if (m === 1) { this.movep(op); break; }
           const n = d[rg];
           this.loc(m, r, 0);
           this.bit((op >> 6) & 3, n, m === 0);
         } else if (rg === 4) {
+          if (m === 1) this.bad(op);
           const n = this.fw() & 255;
           this.loc(m, r, 0);
           this.bit((op >> 6) & 3, n, m === 0);
@@ -1093,6 +1164,8 @@ class M68K {
           const k = [0, 1, 4, 3, -1, 2, 5][rg];
 
           if (m === 7 && r === 4) {
+            if (k > 2 || s === 2) this.bad(op);
+            if (s === 1) this.priv();
             const cur = (s === 0) ? (this.sr & 255) : this.sr;
             const v = (k === 0) ? (cur | imm) : (k === 1) ? (cur & imm) : (cur ^ imm);
             if (s === 0) this.sr = (this.sr & 0xFF00) | (v & 255);
@@ -1123,9 +1196,11 @@ class M68K {
         break;
       }
       case 4: {
-        if (op === 0x4E71 || op === 0x4E70) break;
+        if (op === 0x4E71) break;
+        if (op === 0x4E70) { this.priv(); break; }
         if (op === 0x4E75) { this.pc = this.pop(1); break; }
         if (op === 0x4E73) {
+          this.priv();
           const s = this.pop(0);
           this.pc = this.pop(1);
           this.setSR(s);
@@ -1137,6 +1212,7 @@ class M68K {
           break;
         }
         if (op === 0x4E72) {
+          this.priv();
           this.setSR(this.fw());
           this.stopped = true;
           break;
@@ -1158,6 +1234,7 @@ class M68K {
           break;
         }
         if ((op & 0xFFF0) === 0x4E60) {
+          this.priv();
           if (op & 8) a[r] = this.usp;
           else this.usp = a[r];
           break;
@@ -1182,7 +1259,7 @@ class M68K {
             this.loc(m, r, 1);
             if (t === 0) this.put(1, this.sr);
             else if (t === 4) this.sr = (this.sr & 0xFF00) | (this.get(1) & 255);
-            else if (t === 6) this.setSR(this.get(1));
+            else if (t === 6) { this.priv(); this.setSR(this.get(1)); }
             else this.bad(op);
           } else {
             this.loc(m, r, s);
@@ -1233,12 +1310,16 @@ class M68K {
           } else if (s >= 2) {
             this.movem(op, 0);
           } else {
-            this.bad(op);
+            // NBCD
+            if (m === 1) this.bad(op);
+            this.loc(m, r, 0);
+            this.put(0, this.bcd(1, 0, this.get(0)));
           }
           break;
         }
 
         if (t === 10) {
+          if (op === 0x4AFC) this.bad(op);   // ILLEGAL
           if (s === 3) {
             this.loc(m, r, 0);
             const x = this.get(0);
@@ -1321,8 +1402,9 @@ class M68K {
           this.loc(m, r, 1);
           const x = this.get(1);
           const z = (om === 3) ? (d[rg] & 65535) * (x & 65535) : (d[rg] << 16 >> 16) * x;
-          d[rg] = z | 0;
-          this.cf(z < 0, z === 0, 0, 0);
+          const pr = z | 0;
+          d[rg] = pr;
+          this.cf(pr < 0, pr === 0, 0, 0);
           break;
         }
         if (hi === 12) {
@@ -1361,25 +1443,7 @@ class M68K {
           if (hi === 9 || hi === 13) {
             v = this.xo(hi === 9 ? 1 : 0, s, x, y);
           } else {
-            const X = (this.sr >> 4) & 1;
-            const ux = x & 255;
-            const uy = y & 255;
-            const sub = (hi === 8);
-            let t = sub ? (ux - uy - X) : (ux + uy + X);
-            let cr = 0;
-
-            if (sub) {
-              if ((ux & 15) - (uy & 15) - X < 0) t -= 6;
-              if (t < 0) { t -= 0x60; cr = 1; }
-            } else {
-              if ((ux & 15) + (uy & 15) + X > 9) t += 6;
-              if (t > 0x99) { t += 0x60; cr = 1; }
-            }
-            v = sx(t & 255, 0);
-            this.sr = (this.sr & 0xFFE0) |
-                      (cr ? 17 : 0) |
-                      (v < 0 ? 8 : 0) |
-                      ((this.sr & 4) && v === 0 ? 4 : 0);
+            v = this.bcd(hi === 8, x, y);
           }
           if (!rm) {
             this.em = 0;
@@ -1467,12 +1531,25 @@ class Z80 {
     this.ix = 0;
     this.iy = 0;
     this.iff = 0;
+    this.iff2 = 0;
+    this.im = 0;
+    this.ri = 0;
+    this.rr = 0;
     this.halt = 0;
     this.irq = 0;
     this.t = 0;
     this.cyc = 0;
     this.bank = 0;
   }
+
+  // Rレジスタ (下位7bitがM1サイクルごとにインクリメント)
+  incR() {
+    this.rr = (this.rr & 0x80) | ((this.rr + 1) & 0x7F);
+  }
+
+  // I/Oポート: Genesis のZ80にはポートが無いのでオープンバス扱い
+  inp(port) { return 0xFF; }
+  outp(port, v) {}
 
   rd(a) {
     this.t += 3;
@@ -1665,6 +1742,7 @@ class Z80 {
     let e = -1;
     if (px) e = this.mem(px);
     const op = this.fb();
+    if (!px) this.incR();
     const x = op >> 6;
     const y = (op >> 3) & 7;
     const z = op & 7;
@@ -1688,60 +1766,174 @@ class Z80 {
   ed() {
     const r = this.r;
     const op = this.fb();
+    this.incR();
+    const x = op >> 6;
     const y = (op >> 3) & 7;
+    const z = op & 7;
     const p = y >> 1;
     const q = y & 1;
 
-    if (op === 0x44) {
-      const a = r[7];
-      r[7] = 0;
-      this.alu(2, a);
-    } else if (op === 0x4D || op === 0x45) {
-      this.pc = this.pop();
-      this.iff = 1;
-    } else if ((op & 0xC7) === 0x42) {
-      this.srp(2, this.adc16(this.hl(), this.rp(p), q === 0));
-    } else if ((op & 0xC7) === 0x43) {
-      const n = this.fw();
-      if (!q) this.ww(n, this.rp(p));
-      else this.srp(p, this.rw(n));
-    } else if (op >= 0xA0 && op < 0xC0 && (op & 4) === 0) {
-      const d = (op & 8) ? -1 : 1;
-      const hl = this.hl();
-      const de = (r[2] << 8) | r[3];
-      let bc = (r[0] << 8) | r[1];
-
-      this.wr(de, this.rd(hl));
-      this.sh(hl + d);
-      this.srp(1, de + d);
-      bc = (bc - 1) & 0xFFFF;
-      this.srp(0, bc);
-      this.f = (this.f & 0xC1) | (bc ? 4 : 0);
-
-      if ((op & 0x10) && bc) {
-        this.pc = (this.pc - 2) & 0xFFFF;
-        this.t += 5;
+    if (x === 1) {
+      switch (z) {
+        case 0: {   // IN r,(C)  (y=6 はフラグのみ)
+          const v = this.inp(this.rp(0));
+          if (y !== 6) r[y] = v;
+          this.f = (this.f & 1) | (v & 128) | (v ? 0 : 64) | PAR[v];
+          return;
+        }
+        case 1:     // OUT (C),r  (y=6 は0を出力)
+          this.outp(this.rp(0), (y === 6) ? 0 : r[y]);
+          return;
+        case 2:     // SBC HL,rr / ADC HL,rr
+          this.srp(2, this.adc16(this.hl(), this.rp(p), q === 0));
+          return;
+        case 3: {   // LD (nn),rr / LD rr,(nn)
+          const n = this.fw();
+          if (!q) this.ww(n, this.rp(p));
+          else this.srp(p, this.rw(n));
+          return;
+        }
+        case 4: {   // NEG
+          const a = r[7];
+          r[7] = 0;
+          this.alu(2, a);
+          return;
+        }
+        case 5:     // RETN / RETI
+          this.pc = this.pop();
+          this.iff = this.iff2;
+          return;
+        case 6:     // IM 0/1/2
+          this.im = [0, 0, 1, 2][y & 3];
+          return;
+        default:
+          switch (y) {
+            case 0: this.ri = r[7]; return;   // LD I,A
+            case 1: this.rr = r[7]; return;   // LD R,A
+            case 2:
+            case 3: {                         // LD A,I / LD A,R
+              const v = (y === 2) ? this.ri : this.rr;
+              r[7] = v;
+              this.f = (this.f & 1) | (v & 128) | (v ? 0 : 64) | (this.iff2 ? 4 : 0);
+              return;
+            }
+            case 4:
+            case 5: {                         // RRD / RLD
+              const a = this.hl();
+              const m = this.rd(a);
+              const A = r[7];
+              let nm, na;
+              if (y === 4) {
+                nm = ((A & 15) << 4) | (m >> 4);
+                na = (A & 0xF0) | (m & 15);
+              } else {
+                nm = ((m & 15) << 4) | (A & 15);
+                na = (A & 0xF0) | (m >> 4);
+              }
+              this.wr(a, nm);
+              r[7] = na;
+              this.f = (this.f & 1) | (na & 128) | (na ? 0 : 64) | PAR[na];
+              return;
+            }
+            default: return;                  // NOP
+          }
       }
     }
+
+    // ブロック命令 (y=4:xxI 5:xxD 6:xxIR 7:xxDR / z=0:LD 1:CP 2:IN 3:OUT)
+    if (x === 2 && z < 4 && y >= 4) {
+      const d = (y & 1) ? -1 : 1;
+      const rep = y >= 6;
+      const hl = this.hl();
+
+      if (z === 0) {            // LDI / LDD / LDIR / LDDR
+        const de = (r[2] << 8) | r[3];
+        let bc = (r[0] << 8) | r[1];
+
+        this.wr(de, this.rd(hl));
+        this.sh(hl + d);
+        this.srp(1, de + d);
+        bc = (bc - 1) & 0xFFFF;
+        this.srp(0, bc);
+        this.f = (this.f & 0xC1) | (bc ? 4 : 0);
+
+        if (rep && bc) {
+          this.pc = (this.pc - 2) & 0xFFFF;
+          this.t += 5;
+        }
+      } else if (z === 1) {     // CPI / CPD / CPIR / CPDR
+        const v = this.rd(hl);
+        const a = r[7];
+        const res = (a - v) & 255;
+        const bc = (this.rp(0) - 1) & 0xFFFF;
+
+        this.sh(hl + d);
+        this.srp(0, bc);
+        this.f = (this.f & 1) | 2 | (res & 128) | (res === 0 ? 64 : 0) |
+                 (((a & 15) - (v & 15) < 0) ? 16 : 0) | (bc ? 4 : 0);
+
+        if (rep && bc && res !== 0) {
+          this.pc = (this.pc - 2) & 0xFFFF;
+          this.t += 5;
+        }
+      } else {
+        let v, k;
+        const b0 = r[0];
+        const bp = this.rp(0);
+
+        if (z === 2) {          // INI / IND / INIR / INDR
+          v = this.inp(bp);
+          this.wr(hl, v);
+          r[0] = b0 - 1;
+          this.sh(hl + d);
+          k = v + ((r[1] + d) & 255);
+        } else {                // OUTI / OUTD / OTIR / OTDR
+          v = this.rd(hl);
+          r[0] = b0 - 1;
+          this.outp(this.rp(0), v);
+          this.sh(hl + d);
+          k = v + r[5];
+        }
+        const b = r[0];
+        this.f = (b & 128) | (b ? 0 : 64) | ((v & 128) ? 2 : 0) |
+                 ((k > 255) ? 17 : 0) | PAR[((k & 7) ^ b) & 255];
+
+        if (rep && b) {
+          this.pc = (this.pc - 2) & 0xFFFF;
+          this.t += 5;
+        }
+      }
+      return;
+    }
+    // 上記以外の未定義ED命令はNOP
   }
 
   step() {
     this.t = 0;
     if (this.irq && this.iff) {
       this.iff = 0;
+      this.iff2 = 0;
       this.halt = 0;
       this.push(this.pc);
-      this.pc = 0x38;
-      this.t += 13;
+      if (this.im === 2) {
+        // IM2: データバスは0xFFとして (I<<8|0xFF) のベクタを参照
+        this.pc = this.rw((this.ri << 8) | 0xFF);
+        this.t += 19;
+      } else {
+        this.pc = 0x38;   // IM0(RST 38h) / IM1
+        this.t += 13;
+      }
       return this.t;
     }
     if (this.halt) return 4;
 
     let op = this.fb();
+    this.incR();
     let px = 0;
     while (op === 0xDD || op === 0xFD) {
       px = op;
       op = this.fb();
+      this.incR();
     }
 
     if (px) {
@@ -1785,6 +1977,21 @@ class Z80 {
     if (x === 1) {
       if (op === 0x76) {
         this.halt = 1;
+        return;
+      }
+      if (px && (y === 6 || z === 6)) {
+        // IX/IY は HL と入れ替え済みなので、本物の H/L は退避側(this.ix/iy)にある
+        const sv = (px === 0xDD) ? this.ix : this.iy;
+        const put = v => { if (px === 0xDD) this.ix = v; else this.iy = v; };
+        const a = M();
+        if (y === 6) {
+          this.wr(a, (z === 4) ? (sv >> 8) : (z === 5) ? (sv & 255) : r[z]);
+        } else {
+          const v = this.rd(a);
+          if (y === 4) put((sv & 0xFF) | (v << 8));
+          else if (y === 5) put((sv & 0xFF00) | v);
+          else r[y] = v;
+        }
         return;
       }
       S(y, G(z));
@@ -1913,8 +2120,8 @@ class Z80 {
         switch (y) {
           case 0: this.pc = this.fw(); return;
           case 1: this.cb(px); return;
-          case 2: this.fb(); return;
-          case 3: this.fb(); r[7] = 0xFF; return;
+          case 2: this.outp((r[7] << 8) | this.fb(), r[7]); return;
+          case 3: r[7] = this.inp((r[7] << 8) | this.fb()); return;
           case 4: {
             const t = this.rw(this.sp);
             this.ww(this.sp, this.hl());
@@ -1928,8 +2135,8 @@ class Z80 {
             this.sh(d);
             return;
           }
-          case 6: this.iff = 0; return;
-          default: this.iff = 1; return;
+          case 6: this.iff = this.iff2 = 0; return;
+          default: this.iff = this.iff2 = 1; return;
         }
       case 4: {
         const n = this.fw();
@@ -2473,7 +2680,8 @@ function frame() {
     } catch (e) {
       running = false;
       err = e.message;
-      info.textContent += "\n\n停止: " + err;
+      console.error(e);
+      if (info) info.textContent += "\n\n停止: " + err;
     }
     vdp.renderFrame();
     show();
