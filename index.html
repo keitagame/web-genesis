@@ -1,0 +1,2488 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Genesis Emulator</title>
+  <style>
+ *{
+  color-scheme: dark;
+  box-sizing: border-box;
+}
+body{
+  font-family: "DotGothic16", sans-serif;
+  font-weight: 400;
+  font-style: normal;
+  background: black;
+  color: white;
+  margin: 16px;
+  line-height: 1.6;
+}
+.hidden-input {
+  display: none;
+}
+
+/* ラベルをボタンとして装飾する */
+.upload-label {
+  display: inline-block;
+  border: 1px solid white;
+  color: white;
+  padding: 10px 20px;
+  border-radius: 0px;
+  cursor: pointer;
+}
+
+/* リスト全体の「・」を消して、横並び（Flexbox）にする */
+.nav-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 13px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 15px;
+  align-items: center;
+}
+
+.button, .select-box, .number-input {
+  font-family: "DotGothic16", sans-serif;
+  font-weight: 400;
+  background: black;
+  font-size: 13px;
+  display: inline-block;
+  border: 1px solid white;
+  color: white;
+  padding: 10px 15px;
+  border-radius: 0px;
+  outline: none;
+}
+
+.button {
+  cursor: pointer;
+}
+
+.number-input {
+  width: 60px;
+  text-align: center;
+}
+
+.button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* エクスポート関連スタイル */
+.btn-export {
+  border-color: #00ffcc;
+  color: #00ffcc;
+}
+
+.btn-export.is-exporting {
+  background: #00ffcc;
+  color: black;
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.4; }
+  100% { opacity: 1; }
+}
+
+.export-status {
+  color: #00ffcc;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rec-dot {
+  width: 10px;
+  height: 10px;
+  background-color: #00ffcc;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+canvas{
+  
+  
+  
+  
+  border: 1px solid #333;
+  margin-top: 10px;
+  image-rendering: pixelated;
+  display: block;
+}
+
+.info-container {
+  margin-top: 15px;
+}
+
+h1.title-main {
+  font-size: 20px;
+  margin: 10px 0 5px 0;
+  font-weight: normal;
+}
+
+.info-text {
+  font-size: 14px;
+}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+  <nav>
+    <ul class="nav-list">
+      <li><input type="file" id="rom" accept=".bin,.md,.gen,.smd"></li>
+      
+      <li><button id="rst">リセット</button></li>
+     
+      
+      </ul>
+  </nav>
+</header>
+
+  <canvas id="c" width="320" height="224"></canvas>
+  
+  
+    
+   
+    
+    
+  
+
+
+<script>
+"use strict";
+
+// ==========================================
+// VDP (Video Display Processor)
+// ==========================================
+class VDP {
+  constructor() {
+    this.vram = new Uint8Array(65536);
+    this.cram = new Uint16Array(64);
+    this.vsram = new Uint16Array(40);
+    this.reg = new Uint8Array(24);
+    this.code = 0;
+    this.addr = 0;
+    this.pend = false;
+    this.first = 0;
+    this.status = 0x3600;
+    this.bus = null;
+    this.fb = new Uint32Array(320 * 224);
+  }
+
+  color(i) {
+    const c = this.cram[i & 63];
+    return 0xFF000000 | (((c >> 9) & 7) * 36) << 16 | (((c >> 5) & 7) * 36) << 8 | (((c >> 1) & 7) * 36);
+  }
+
+  // note: ABGR little-endian pixel
+  rgba(i) {
+    const c = this.cram[i & 63];
+    return 0xFF000000 | (((c >> 9) & 7) * 36) << 16 | (((c >> 5) & 7) * 36) << 8 | (((c >> 1) & 7) * 36);
+  }
+
+  px(i) {
+    const c = this.cram[i & 63];
+    const r = ((c >> 1) & 7) * 36;
+    const g = ((c >> 5) & 7) * 36;
+    const b = ((c >> 9) & 7) * 36;
+    return 0xFF000000 | (b << 16) | (g << 8) | r;
+  }
+
+  writeCtrl(v) {
+    if (!this.pend && (v & 0xC000) === 0x8000) {
+      this.reg[(v >> 8) & 31] = v & 255;
+      return;
+    }
+    if (!this.pend) {
+      this.first = v;
+      this.pend = true;
+      this.code = (this.code & 0x3C) | (v >> 14);
+      this.addr = (this.addr & 0xC000) | (v & 0x3FFF);
+      return;
+    }
+    this.pend = false;
+    this.code = (this.code & 3) | ((v >> 2) & 0x3C);
+    this.addr = (this.addr & 0x3FFF) | ((v & 3) << 14);
+
+    if ((this.code & 0x20) && (this.reg[1] & 0x10)) {
+      this.dma();
+    }
+  }
+
+  readCtrl() {
+    this.pend = false;
+    return this.status;
+  }
+
+  writeData(v) {
+    this.pend = false;
+    const fl = this.dmaFill;
+    this.dmaFill = false;
+
+    switch (this.code & 15) {
+      case 1:
+        this.vram[this.addr] = v >> 8;
+        this.vram[this.addr ^ 1] = v & 255;
+        break;
+      case 3:
+        this.cram[(this.addr >> 1) & 63] = v;
+        break;
+      case 5:
+        this.vsram[(this.addr >> 1) % 40] = v;
+        break;
+    }
+
+    this.addr = (this.addr + this.reg[15]) & 0xFFFF;
+
+    if (fl) {
+      const b = v >> 8;
+      for (let i = 0; i < this.dmaLen; i++) {
+        this.vram[this.addr ^ 1] = b;
+        this.addr = (this.addr + this.reg[15]) & 0xFFFF;
+      }
+    }
+  }
+
+  readData() {
+    this.pend = false;
+    let v = 0;
+    switch (this.code & 15) {
+      case 0:
+        v = (this.vram[this.addr] << 8) | this.vram[this.addr ^ 1];
+        break;
+      case 8:
+        v = this.cram[(this.addr >> 1) & 63];
+        break;
+      case 4:
+        v = this.vsram[(this.addr >> 1) % 40];
+        break;
+    }
+    this.addr = (this.addr + this.reg[15]) & 0xFFFF;
+    return v;
+  }
+
+  dma() {
+    const r = this.reg;
+    const len = r[19] | (r[20] << 8);
+    const m = r[23] >> 6;
+
+    if (m < 2) {
+      let src = ((r[21] | (r[22] << 8) | ((r[23] & 0x7F) << 16)) << 1) >>> 0;
+      const count = len || 0x10000;
+      for (let i = 0; i < count; i++) {
+        this.writeData(this.bus.read16(src));
+        src += 2;
+      }
+    } else if (m === 2) {
+      this.dmaFill = true;
+      this.dmaLen = len || 0x10000;
+    } else {
+      let s = r[21] | (r[22] << 8);
+      for (let i = 0; i < len; i++) {
+        this.vram[this.addr] = this.vram[(s++) & 0xFFFF];
+        this.addr = (this.addr + r[15]) & 0xFFFF;
+      }
+    }
+  }
+
+  tilePx(t, x, y, hf, vf) {
+    const o = t * 32 + (vf ? 7 - y : y) * 4 + ((hf ? 7 - x : x) >> 1);
+    const b = this.vram[o & 0xFFFF];
+    return ((hf ? 7 - x : x) & 1) ? (b & 15) : (b >> 4);
+  }
+
+  plane(base, y, w, hs, vs, line) {
+    const r = this.reg;
+    const pw = [32, 64, 32, 128][r[16] & 3];
+    const ph = [32, 64, 32, 128][(r[16] >> 4) & 3];
+    const V = this.vram;
+
+    for (let x = 0; x < w; x++) {
+      const yy = (y + vs(x >> 4)) & (ph * 8 - 1);
+      const xx = (x - hs) & (pw * 8 - 1);
+      const a = base + ((yy >> 3) * pw + (xx >> 3)) * 2;
+      const e = (V[a & 0xFFFF] << 8) | V[(a + 1) & 0xFFFF];
+      const p = this.tilePx(e & 0x7FF, xx & 7, yy & 7, e & 0x800, e & 0x1000);
+
+      if (p) {
+        line[x] = (e & 0x8000 ? 0x40 : 0) | (((e >> 13) & 3) << 4) | p;
+      }
+    }
+  }
+
+  sprites(y, w, ls) {
+    const V = this.vram;
+    const base = (this.reg[5] & 0x7F) << 9;
+    const H = (w === 320);
+    const lim = H ? 20 : 16;
+    const tot = H ? 80 : 64;
+    let idx = 0;
+    let cnt = 0;
+
+    for (let n = 0; n < tot; n++) {
+      const o = (base + idx * 8) & 0xFFF8;
+      const sy = (((V[o] << 8) | V[o + 1]) & 0x3FF) - 128;
+      const sz = V[o + 2];
+      const link = V[o + 3] & 0x7F;
+      const e = (V[o + 4] << 8) | V[o + 5];
+      const rx = ((V[o + 6] << 8) | V[o + 7]) & 0x1FF;
+      const sx = rx - 128;
+      const hc = ((sz >> 2) & 3) + 1;
+      const vc = (sz & 3) + 1;
+
+      if (y >= sy && y < sy + vc * 8) {
+        if (rx === 0 && cnt > 0) break;
+        if (++cnt > lim) break;
+
+        const ry = y - sy;
+        const hf = e & 0x800;
+        const vf = e & 0x1000;
+        const row = vf ? (vc * 8 - 1 - ry) : ry;
+
+        for (let cx = 0; cx < hc; cx++) {
+          const col = hf ? (hc - 1 - cx) : cx;
+          const t = (e & 0x7FF) + col * vc + (row >> 3);
+
+          for (let i = 0; i < 8; i++) {
+            const px = sx + cx * 8 + i;
+            if (px < 0 || px >= w || (ls[px] & 15)) continue;
+            const p = this.tilePx(t, i, row & 7, hf, 0);
+            if (p) {
+              ls[px] = (e & 0x8000 ? 0x40 : 0) | (((e >> 13) & 3) << 4) | p;
+            }
+          }
+        }
+      }
+
+      idx = link;
+      if (!idx) break;
+    }
+  }
+
+  renderFrame() {
+    const r = this.reg;
+    const w = (r[12] & 1) ? 320 : 256;
+    const la = new Uint16Array(320);
+    const lb = new Uint16Array(320);
+    const ls = new Uint16Array(320);
+    const V = this.vram;
+
+    const bg = this.px(r[7] & 63);
+    const on = r[1] & 0x40;
+    const hm = r[11] & 3;
+    const vm = r[11] & 4;
+    const hb = (r[13] & 0x3F) << 10;
+    const vsr = this.vsram;
+
+    const hv = a => ((V[a & 0xFFFF] << 8) | V[(a + 1) & 0xFFFF]) << 22 >> 22;
+    const wr = r[17];
+    const wd = r[18];
+    const wx = (wr & 31) * 16;
+    const wy = (wd & 31) * 8;
+    const wb = (r[3] & (w === 320 ? 0x3C : 0x3E)) << 10;
+    const ww = (w === 320) ? 64 : 32;
+
+    for (let y = 0; y < 224; y++) {
+      la.fill(0);
+      lb.fill(0);
+      ls.fill(0);
+
+      if (on) {
+        const o = (hm === 0) ? 0 : (hm === 3) ? (y * 4) : ((y >> 3) * 32);
+
+        this.plane((r[4] & 7) << 13, y, w, hv(hb + o + 2), c => vm ? (vsr[c * 2 + 1] & 0x3FF) : (vsr[1] & 0x3FF), lb);
+        this.plane((r[2] & 0x38) << 10, y, w, hv(hb + o), c => vm ? (vsr[c * 2] & 0x3FF) : (vsr[0] & 0x3FF), la);
+
+        for (let x = 0; x < w; x++) {
+          if (((wr & 0x80) ? (x >= wx) : (x < wx)) || ((wd & 0x80) ? (y >= wy) : (y < wy))) {
+            const a = wb + ((y >> 3) * ww + (x >> 3)) * 2;
+            const e = (V[a & 0xFFFF] << 8) | V[(a + 1) & 0xFFFF];
+            const p = this.tilePx(e & 0x7FF, x & 7, y & 7, e & 0x800, e & 0x1000);
+            la[x] = p ? ((e & 0x8000 ? 0x40 : 0) | (((e >> 13) & 3) << 4) | p) : 0;
+          }
+        }
+        this.sprites(y, w, ls);
+      }
+
+      for (let x = 0; x < 320; x++) {
+        let v = 0;
+        if (on && x < w) {
+          const A = la[x];
+          const B = lb[x];
+          const S = ls[x];
+          v = (S & 15 && S & 64) ? S :
+              (A & 15 && A & 64) ? A :
+              (B & 15 && B & 64) ? B :
+              (S & 15) ? S :
+              (A & 15) ? A :
+              (B & 15) ? B : 0;
+        }
+        this.fb[y * 320 + x] = (v & 15) ? this.px(v & 63) : bg;
+      }
+    }
+  }
+}
+
+// ==========================================
+// Bus System
+// ==========================================
+class Bus {
+  constructor(vdp) {
+    this.rom = new Uint8Array(0);
+    this.ram = new Uint8Array(65536);
+    this.z80 = new Uint8Array(8192);
+    this.sram = new Uint8Array(65536).fill(255);
+    this.vdp = vdp;
+    vdp.bus = this;
+
+    this.ym = new YM();
+    this.psg = new PSG();
+    this.zrst = 0;
+    this.zcpu = null;
+    this.pad = 0xFFF;
+    this.ctl = [0, 0, 0];
+    this.dat = [0x7F, 0x7F, 0x7F];
+    this.cnt = [0, 0];
+    this.busreq = 0;
+    this.bank = [0, 1, 2, 3, 4, 5, 6, 7];
+    this.sramOn = false;
+    this.sdirty = false;
+    this.ss = 0;
+    this.se = 0;
+    this.sm = 0;
+    this.skey = "";
+  }
+
+  initRom() {
+    const r = this.rom;
+    const w = a => ((r[a] << 24) | (r[a + 1] << 16) | (r[a + 2] << 8) | r[a + 3]) >>> 0;
+
+    this.bank = [0, 1, 2, 3, 4, 5, 6, 7];
+    this.ram.fill(0);
+    this.z80.fill(0);
+    this.sram.fill(255);
+    this.cnt = [0, 0];
+    this.dat = [0x7F, 0x7F, 0x7F];
+    this.ctl = [0, 0, 0];
+
+    this.sramOn = (r.length > 0x1BC) && (r[0x1B0] === 0x52) && (r[0x1B1] === 0x41) && (r.length <= 0x200000);
+
+    if (this.sramOn) {
+      this.ss = w(0x1B4);
+      this.se = w(0x1B8);
+      const t = r[0x1B2];
+      this.sm = (t === 0xF8) ? 1 : (t === 0xB8) ? 2 : 0;
+      this.skey = "gensram:" + new TextDecoder().decode(r.slice(0x150, 0x180)).trim() + r.length;
+
+      try {
+        const q = localStorage.getItem(this.skey);
+        if (q) {
+          this.sram.set(Uint8Array.from(atob(q), c => c.charCodeAt(0)));
+        }
+      } catch (e) {}
+    }
+  }
+
+  saveSram() {
+    if (!this.sramOn || !this.sdirty) return;
+    this.sdirty = false;
+
+    try {
+      let q = "";
+      for (let i = 0; i < 65536; i += 4096) {
+        q += String.fromCharCode.apply(null, this.sram.subarray(i, i + 4096));
+      }
+      localStorage.setItem(this.skey, btoa(q));
+    } catch (e) {}
+  }
+
+  sI(a) {
+    const o = a - this.ss;
+    return (this.sm === 0) ? o :
+           (this.sm === 1) ? ((a & 1) ? (o >> 1) : -1) :
+           ((a & 1) ? -1 : (o >> 1));
+  }
+
+  rpad(p) {
+    const P = p ? 0xFFF : this.pad;
+    const c = this.cnt[p];
+    const th = (this.ctl[p] & 0x40) ? (this.dat[p] & 0x40) : 0x40;
+    let v;
+
+    if (th) {
+      v = 0x40 | (c === 3 ? (((P >> 8) & 15) | (P & 0x30)) : (P & 0x3F));
+    } else {
+      v = (c === 2 ? 0 : c === 3 ? 15 : (P & 3)) | (((P >> 6) & 1) << 4) | (((P >> 7) & 1) << 5);
+    }
+    const o = this.ctl[p] & 0x7F;
+    return (v & ~o) | (this.dat[p] & o);
+  }
+
+  read8(a) {
+    a &= 0xFFFFFF;
+
+    if (a < 0x400000) {
+      if (this.sramOn && a >= this.ss && a <= this.se) {
+        const i = this.sI(a);
+        return i < 0 ? 255 : this.sram[i & 0xFFFF];
+      }
+      return this.rom[(this.bank[a >> 19] << 19) | (a & 0x7FFFF)] | 0;
+    }
+
+    if (a >= 0xE00000) return this.ram[a & 0xFFFF];
+
+    if (a >= 0xC00000 && a < 0xC00010) {
+      const v = this.read16(a & ~1);
+      return (a & 1) ? (v & 255) : (v >> 8);
+    }
+
+    if (a >= 0xA00000 && a < 0xA10000) {
+      return (a < 0xA04000) ? this.z80[a & 0x1FFF] :
+             (a < 0xA04004) ? this.ym.read(a & 3) : 0;
+    }
+
+    if (a >= 0xA10000 && a < 0xA10020 && (a & 1)) {
+      const p = (a - 0xA10001) >> 1;
+      if (p === 0) return 0xA0;
+      if (p === 1 || p === 2) return this.rpad(p - 1);
+      return (p === 3) ? this.dat[2] : (p <= 6) ? this.ctl[p - 4] : 0;
+    }
+
+    if (a === 0xA11100) return this.busreq ? 0 : 1;
+    return 0;
+  }
+
+  read16(a) {
+    a &= 0xFFFFFF;
+    if (a >= 0xC00008 && a < 0xC00010) {
+      return ((this.vdp.line & 255) << 8) | 0x80;
+    }
+    if (a >= 0xC00000 && a < 0xC00008) {
+      return (a & 4) ? this.vdp.readCtrl() : this.vdp.readData();
+    }
+    return (this.read8(a) << 8) | this.read8(a + 1);
+  }
+
+  read32(a) {
+    return ((this.read16(a) << 16) | this.read16(a + 2)) >>> 0;
+  }
+
+  write8(a, v) {
+    a &= 0xFFFFFF;
+    v &= 255;
+
+    if (a >= 0xE00000) {
+      this.ram[a & 0xFFFF] = v;
+      return;
+    }
+
+    if (a < 0x400000) {
+      if (this.sramOn && a >= this.ss && a <= this.se) {
+        const i = this.sI(a);
+        if (i >= 0) {
+          this.sram[i & 0xFFFF] = v;
+          this.sdirty = true;
+        }
+      }
+      return;
+    }
+
+    if (a >= 0xC00011 && a <= 0xC00017 && (a & 1)) {
+      this.psg.write(v);
+      return;
+    }
+
+    if (a >= 0xC00000 && a < 0xC00010) {
+      this.write16(a & ~1, (v << 8) | v);
+      return;
+    }
+
+    if (a >= 0xA00000 && a < 0xA10000) {
+      if (a < 0xA04000) {
+        this.z80[a & 0x1FFF] = v;
+      } else if (a < 0xA04004) {
+        this.ym.write(a & 3, v);
+      }
+      return;
+    }
+
+    if (a >= 0xA10000 && a < 0xA10020) {
+      if (!(a & 1)) return;
+      const p = (a - 0xA10001) >> 1;
+      if (p >= 1 && p <= 3) {
+        const k = p - 1;
+        const o = this.dat[k];
+        this.dat[k] = v;
+        if (k < 2 && !(o & 0x40) && (v & 0x40) && (this.ctl[k] & 0x40) && this.cnt[k] < 3) {
+          this.cnt[k]++;
+        }
+      } else if (p >= 4 && p <= 6) {
+        this.ctl[p - 4] = v;
+      }
+      return;
+    }
+
+    if (a === 0xA11100) {
+      this.busreq = v & 1;
+    } else if (a === 0xA11200) {
+      this.zrst = v & 1;
+      if (!this.zrst) {
+        this.zcpu.reset();
+        this.ym.reset();
+        this.psg.reset();
+      }
+    } else if (a >= 0xA130F3 && a <= 0xA130FF && (a & 1)) {
+      this.bank[(a - 0xA130F1) >> 1] = v & 0x3F;
+    }
+  }
+
+  write16(a, v) {
+    a &= 0xFFFFFF;
+    if (a >= 0xC00000 && a < 0xC00008) {
+      if (a & 4) {
+        this.vdp.writeCtrl(v & 0xFFFF);
+      } else {
+        this.vdp.writeData(v & 0xFFFF);
+      }
+      return;
+    }
+
+    if (a >= 0xE00000) {
+      this.ram[a & 0xFFFF] = v >> 8;
+      this.ram[(a + 1) & 0xFFFF] = v & 255;
+      return;
+    }
+
+    if (a >= 0xA10000 && a < 0xA10020) {
+      this.write8(a | 1, v & 255);
+      return;
+    }
+
+    if ((a >= 0xA00000 && a < 0xA10000) || a === 0xA11100 || a === 0xA11200 || (a >= 0xA130F0 && a < 0xA13100)) {
+      this.write8(a, v >> 8);
+      this.write8(a | 1, v & 255);
+      return;
+    }
+
+    if (a < 0x400000) {
+      this.write8(a, v >> 8);
+      this.write8(a + 1, v & 255);
+    }
+  }
+
+  write32(a, v) {
+    this.write16(a, v >>> 16);
+    this.write16(a + 2, v & 0xFFFF);
+  }
+}
+
+// ==========================================
+// CPU (M68000)
+// ==========================================
+const sx = (v, s) => (s === 0) ? (v << 24 >> 24) : (s === 1) ? (v << 16 >> 16) : (v | 0);
+
+class M68K {
+  constructor(bus) {
+    this.bus = bus;
+    this.d = new Int32Array(8);
+    this.a = new Int32Array(8);
+    this.pc = 0;
+    this.sr = 0x2700;
+    this.usp = 0;
+    this.stopped = false;
+    this.irq = 0;
+    this.em = 0;
+    this.er = 0;
+    this.ea = 0;
+  }
+
+  reset() {
+    this.sr = 0x2700;
+    this.usp = 0;
+    this.a[7] = this.bus.read32(0);
+    this.pc = this.bus.read32(4);
+    this.stopped = false;
+    this.irq = 0;
+  }
+
+  bad(op) {
+    throw new Error(
+      "未実装の命令 op=$" + (op & 0xFFFF).toString(16).toUpperCase() +
+      " PC=$" + (this.pc - 2).toString(16).toUpperCase()
+    );
+  }
+
+  setSR(v) {
+    if ((v ^ this.sr) & 0x2000) {
+      const t = this.a[7];
+      this.a[7] = this.usp;
+      this.usp = t;
+    }
+    this.sr = v & 0xF71F;
+  }
+
+  rd(a, s) {
+    const b = this.bus;
+    return (s === 0) ? (b.read8(a) << 24 >> 24) :
+           (s === 1) ? (b.read16(a) << 16 >> 16) :
+           (b.read32(a) | 0);
+  }
+
+  wr(a, s, v) {
+    const b = this.bus;
+    if (s === 0) b.write8(a, v & 255);
+    else if (s === 1) b.write16(a, v & 0xFFFF);
+    else b.write32(a, v);
+  }
+
+  fw() {
+    const v = (this.bus.read16(this.pc) << 16) >> 16;
+    this.pc += 2;
+    return v;
+  }
+
+  fl() {
+    const v = this.bus.read32(this.pc) | 0;
+    this.pc += 4;
+    return v;
+  }
+
+  push(v, l) {
+    this.a[7] -= l ? 4 : 2;
+    this.wr(this.a[7], l ? 2 : 1, v);
+  }
+
+  pop(l) {
+    const v = this.rd(this.a[7], l ? 2 : 1);
+    this.a[7] += l ? 4 : 2;
+    return v;
+  }
+
+  ix() {
+    const e = this.fw();
+    const x = (e & 0x8000) ? this.a[(e >> 12) & 7] : this.d[(e >> 12) & 7];
+    return (e << 24 >> 24) + ((e & 0x800) ? x : (x << 16 >> 16));
+  }
+
+  exc(v, l) {
+    const o = this.sr;
+    this.setSR(o | 0x2000);
+    this.push(this.pc, 1);
+    this.push(o, 0);
+    if (l != null) {
+      this.sr = (this.sr & 0xF8FF) | (l << 8);
+    }
+    this.pc = this.bus.read32(v * 4);
+  }
+
+  cf(n, z, v, c) {
+    this.sr = (this.sr & 0xFFF0) | (n ? 8 : 0) | (z ? 4 : 0) | (v ? 2 : 0) | (c ? 1 : 0);
+  }
+
+  cc(c) {
+    const s = this.sr;
+    const N = (s >> 3) & 1;
+    const Z = (s >> 2) & 1;
+    const V = (s >> 1) & 1;
+    const C = s & 1;
+
+    switch (c) {
+      case 0:  return 1;
+      case 1:  return 0;
+      case 2:  return !C && !Z;
+      case 3:  return C || Z;
+      case 4:  return !C;
+      case 5:  return C;
+      case 6:  return !Z;
+      case 7:  return Z;
+      case 8:  return !V;
+      case 9:  return V;
+      case 10: return !N;
+      case 11: return N;
+      case 12: return N === V;
+      case 13: return N !== V;
+      case 14: return !Z && (N === V);
+      default: return Z || (N !== V);
+    }
+  }
+
+  loc(m, r, s) {
+    this.em = m;
+    this.er = r;
+    const a = this.a;
+    const n = (s === 0) ? 1 : (s === 1) ? 2 : 4;
+
+    switch (m) {
+      case 0:
+      case 1:
+        return;
+      case 2:
+        this.ea = a[r];
+        return;
+      case 3:
+        this.ea = a[r];
+        a[r] += (s === 0 && r === 7) ? 2 : n;
+        return;
+      case 4:
+        a[r] -= (s === 0 && r === 7) ? 2 : n;
+        this.ea = a[r];
+        return;
+      case 5:
+        this.ea = a[r] + this.fw();
+        return;
+      case 6:
+        this.ea = a[r] + this.ix();
+        return;
+      default: {
+        const p = this.pc;
+        switch (r) {
+          case 0: this.ea = this.fw(); return;
+          case 1: this.ea = this.fl(); return;
+          case 2: this.ea = p + this.fw(); return;
+          case 3: this.ea = p + this.ix(); return;
+          case 4:
+            this.ea = this.pc + (s === 0 ? 1 : 0);
+            this.pc += (s === 2 ? 4 : 2);
+            return;
+        }
+        this.bad(0);
+      }
+    }
+  }
+
+  get(s) {
+    const m = this.em;
+    return (m === 0) ? sx(this.d[this.er], s) :
+           (m === 1) ? sx(this.a[this.er], s) :
+           this.rd(this.ea, s);
+  }
+
+  put(s, v) {
+    const m = this.em;
+    const r = this.er;
+    const d = this.d;
+
+    if (m === 0) {
+      d[r] = (s === 0) ? ((d[r] & ~255) | (v & 255)) :
+             (s === 1) ? ((d[r] & ~65535) | (v & 65535)) : v;
+    } else if (m === 1) {
+      this.a[r] = v;
+    } else {
+      this.wr(this.ea, s, v);
+    }
+  }
+
+  // k: 0 OR, 1 AND, 2 EOR, 3 ADD, 4 SUB, 5 CMP  (a=dst, b=src)
+  alu(k, s, a, b) {
+    let r;
+    if (k < 3) {
+      r = sx((k === 0) ? (a | b) : (k === 1) ? (a & b) : (a ^ b), s);
+      this.cf(r < 0, r === 0, 0, 0);
+      return r;
+    }
+
+    const m = (s === 0) ? 255 : (s === 1) ? 65535 : 4294967295;
+    const sb = (s === 0) ? 128 : (s === 1) ? 32768 : 2147483648;
+    const ua = (a & m) >>> 0;
+    const ub = (b & m) >>> 0;
+    let t, c, v, res;
+
+    if (k === 3) {
+      t = ua + ub;
+      c = t > m;
+      res = c ? (t - m - 1) : t;
+      v = ((ua ^ res) & (ub ^ res) & sb) !== 0;
+    } else {
+      t = ua - ub;
+      c = t < 0;
+      res = c ? (t + m + 1) : t;
+      v = ((ua ^ ub) & (ua ^ res) & sb) !== 0;
+    }
+
+    r = sx(res, s);
+    this.sr = (this.sr & (k === 5 ? 0xFFF0 : 0xFFE0)) |
+              (k !== 5 && c ? 16 : 0) |
+              (r < 0 ? 8 : 0) |
+              (r === 0 ? 4 : 0) |
+              (v ? 2 : 0) |
+              (c ? 1 : 0);
+    return r;
+  }
+
+  sh(t, l, s, v, c) {
+    const n = 8 << s;
+    const top = Math.pow(2, n - 1);
+    const M = Math.pow(2, n);
+    let x = (n === 32) ? (v >>> 0) : (v & (M - 1));
+    let cy = 0;
+    let ov = 0;
+    let xf = (this.sr >> 4) & 1;
+
+    for (let i = 0; i < c; i++) {
+      let out, ins;
+      if (l) {
+        out = (x >= top) ? 1 : 0;
+        const nx = (x * 2) % M;
+        if (t === 0 && ((nx >= top) !== (x >= top))) ov = 1;
+        ins = (t === 3) ? out : (t === 2) ? xf : 0;
+        x = nx + ins;
+      } else {
+        out = x & 1;
+        const sg = (x >= top) ? 1 : 0;
+        x = Math.floor(x / 2);
+        ins = (t === 0) ? sg : (t === 1) ? 0 : (t === 2) ? xf : out;
+        x += ins ? top : 0;
+      }
+      cy = out;
+      if (t !== 3) xf = out;
+    }
+
+    const r = sx(x, s);
+    const has = c > 0;
+    const X = (this.sr >> 4) & 1;
+
+    this.sr = (this.sr & 0xFFE0) |
+              ((has && t !== 3 ? cy : X) << 4) |
+              (r < 0 ? 8 : 0) |
+              (r === 0 ? 4 : 0) |
+              (ov ? 2 : 0) |
+              (has ? cy : (t === 2 ? X : 0));
+    return r;
+  }
+
+  xo(k, s, x, y) {
+    const X = (this.sr >> 4) & 1;
+    const M = (s === 0) ? 255 : (s === 1) ? 65535 : 4294967295;
+    const B = (s === 0) ? 128 : (s === 1) ? 32768 : 2147483648;
+    const a = (x & M) >>> 0;
+    const b = (y & M) >>> 0;
+
+    const t = k ? (a - b - X) : (a + b + X);
+    const c = k ? (t < 0) : (t > M);
+    const res = k ? (c ? t + M + 1 : t) : (c ? t - M - 1 : t);
+    const ov = k ? ((a ^ b) & (a ^ res) & B) : ((a ^ res) & (b ^ res) & B);
+    const r = sx(res, s);
+
+    this.sr = (this.sr & 0xFFE0) |
+              (c ? 17 : 0) |
+              (r < 0 ? 8 : 0) |
+              ((this.sr & 4) && r === 0 ? 4 : 0) |
+              (ov ? 2 : 0);
+    return r;
+  }
+
+  bit(t, n, dr) {
+    const s = dr ? 2 : 0;
+    const v = this.get(s);
+    n &= dr ? 31 : 7;
+    this.sr = (this.sr & ~4) | (((v >> n) & 1) ? 0 : 4);
+    if (t) {
+      this.put(s, (t === 1) ? (v ^ (1 << n)) : (t === 2) ? (v & ~(1 << n)) : (v | (1 << n)));
+    }
+  }
+
+  div(rg, x, sg) {
+    const d = this.d;
+    const dv = sg ? x : (x & 0xFFFF);
+    if (!dv) {
+      this.exc(5);
+      return;
+    }
+    const n = sg ? (d[rg] | 0) : (d[rg] >>> 0);
+    const q = Math.trunc(n / dv);
+    const rem = n - q * dv;
+
+    if (sg ? (q < -32768 || q > 32767) : (q > 65535)) {
+      this.sr = (this.sr & 0xFFF0) | 2;
+      return;
+    }
+    d[rg] = ((rem & 0xFFFF) << 16) | (q & 0xFFFF);
+    this.cf(q & 0x8000, (q & 0xFFFF) === 0, 0, 0);
+  }
+
+  movem(op, dir) {
+    const s = (op & 0x40) ? 2 : 1;
+    const n = (s === 2) ? 4 : 2;
+    const mk = this.fw() & 0xFFFF;
+    const m = (op >> 3) & 7;
+    const r = op & 7;
+    const d = this.d;
+    const a = this.a;
+    const R = k => (k < 8) ? d[k] : a[k - 8];
+
+    if (!dir) {
+      if (m === 4) {
+        let ad = a[r];
+        for (let i = 0; i < 16; i++) {
+          if ((mk >> i) & 1) {
+            ad -= n;
+            this.wr(ad, s, R(15 - i));
+          }
+        }
+        a[r] = ad;
+      } else {
+        this.loc(m, r, s);
+        let ad = this.ea;
+        for (let i = 0; i < 16; i++) {
+          if ((mk >> i) & 1) {
+            this.wr(ad, s, R(i));
+            ad += n;
+          }
+        }
+      }
+    } else {
+      let ad;
+      if (m === 3) {
+        ad = a[r];
+      } else {
+        this.loc(m, r, s);
+        ad = this.ea;
+      }
+      for (let i = 0; i < 16; i++) {
+        if ((mk >> i) & 1) {
+          const v = this.rd(ad, s);
+          ad += n;
+          if (i < 8) d[i] = v;
+          else a[i - 8] = v;
+        }
+      }
+      if (m === 3) a[r] = ad;
+    }
+  }
+
+  step() {
+    if (this.irq > ((this.sr >> 8) & 7)) {
+      const l = this.irq;
+      this.irq = 0;
+      this.stopped = false;
+      this.exc(24 + l, l);
+      return 44;
+    }
+    if (this.stopped) return 4;
+
+    const op = this.fw() & 0xFFFF;
+    const d = this.d;
+    const a = this.a;
+    const hi = op >> 12;
+    const m = (op >> 3) & 7;
+    const r = op & 7;
+    const rg = (op >> 9) & 7;
+
+    switch (hi) {
+      case 0: {
+        if (op & 0x100) {
+          if (m === 1) this.bad(op);
+          const n = d[rg];
+          this.loc(m, r, 0);
+          this.bit((op >> 6) & 3, n, m === 0);
+        } else if (rg === 4) {
+          const n = this.fw() & 255;
+          this.loc(m, r, 0);
+          this.bit((op >> 6) & 3, n, m === 0);
+        } else {
+          const s = (op >> 6) & 3;
+          if (s === 3 || rg === 7) this.bad(op);
+          const imm = (s === 2) ? this.fl() : this.fw();
+          const k = [0, 1, 4, 3, -1, 2, 5][rg];
+
+          if (m === 7 && r === 4) {
+            const cur = (s === 0) ? (this.sr & 255) : this.sr;
+            const v = (k === 0) ? (cur | imm) : (k === 1) ? (cur & imm) : (cur ^ imm);
+            if (s === 0) this.sr = (this.sr & 0xFF00) | (v & 255);
+            else this.setSR(v);
+            break;
+          }
+          this.loc(m, r, s);
+          const x = this.get(s);
+          const v = this.alu(k, s, x, imm);
+          if (k !== 5) this.put(s, v);
+        }
+        break;
+      }
+      case 1:
+      case 2:
+      case 3: {
+        const s = (hi === 1) ? 0 : (hi === 3) ? 1 : 2;
+        this.loc(m, r, s);
+        const v = this.get(s);
+        const dm = (op >> 6) & 7;
+        if (dm === 1) {
+          a[rg] = v;
+          break;
+        }
+        this.loc(dm, rg, s);
+        this.put(s, v);
+        this.cf(v < 0, v === 0, 0, 0);
+        break;
+      }
+      case 4: {
+        if (op === 0x4E71 || op === 0x4E70) break;
+        if (op === 0x4E75) { this.pc = this.pop(1); break; }
+        if (op === 0x4E73) {
+          const s = this.pop(0);
+          this.pc = this.pop(1);
+          this.setSR(s);
+          break;
+        }
+        if (op === 0x4E77) {
+          this.sr = (this.sr & 0xFF00) | (this.pop(0) & 255);
+          this.pc = this.pop(1);
+          break;
+        }
+        if (op === 0x4E72) {
+          this.setSR(this.fw());
+          this.stopped = true;
+          break;
+        }
+        if (op === 0x4E76) {
+          if (this.sr & 2) this.exc(7);
+          break;
+        }
+        if ((op & 0xFFF0) === 0x4E40) { this.exc(32 + (op & 15)); break; }
+        if ((op & 0xFFF8) === 0x4E50) {
+          this.push(a[r], 1);
+          a[r] = a[7];
+          a[7] += this.fw();
+          break;
+        }
+        if ((op & 0xFFF8) === 0x4E58) {
+          a[7] = a[r];
+          a[r] = this.pop(1);
+          break;
+        }
+        if ((op & 0xFFF0) === 0x4E60) {
+          if (op & 8) a[r] = this.usp;
+          else this.usp = a[r];
+          break;
+        }
+        if ((op & 0xFF80) === 0x4E80) {
+          this.loc(m, r, 2);
+          if (!(op & 0x40)) this.push(this.pc, 1);
+          this.pc = this.ea;
+          break;
+        }
+        if ((op & 0x1C0) === 0x1C0) {
+          this.loc(m, r, 2);
+          a[rg] = this.ea;
+          break;
+        }
+
+        const t = (op >> 8) & 15;
+        const s = (op >> 6) & 3;
+
+        if (t === 0 || t === 2 || t === 4 || t === 6) {
+          if (s === 3) {
+            this.loc(m, r, 1);
+            if (t === 0) this.put(1, this.sr);
+            else if (t === 4) this.sr = (this.sr & 0xFF00) | (this.get(1) & 255);
+            else if (t === 6) this.setSR(this.get(1));
+            else this.bad(op);
+          } else {
+            this.loc(m, r, s);
+            const x = (t === 2) ? 0 : this.get(s);
+            if (t === 2) {
+              this.put(s, 0);
+              this.cf(0, 1, 0, 0);
+            } else if (t === 4) {
+              this.put(s, this.alu(4, s, 0, x));
+            } else if (t === 6) {
+              const v = sx(~x, s);
+              this.put(s, v);
+              this.cf(v < 0, v === 0, 0, 0);
+            } else if (t === 0) {
+              this.put(s, this.xo(1, s, 0, x));
+            } else {
+              this.bad(op);
+            }
+          }
+          break;
+        }
+
+        if ((op & 0x1C0) === 0x180) {
+          this.loc(m, r, 1);
+          const x = this.get(1);
+          const n = (d[rg] << 16) >> 16;
+          if (n < 0 || n > x) {
+            this.sr = (this.sr & 0xFFF0) | (n < 0 ? 8 : 0);
+            this.exc(6);
+          }
+          break;
+        }
+
+        if (t === 8) {
+          if (s === 1) {
+            if (m === 0) {
+              const v = (d[r] << 16) | (d[r] >>> 16);
+              d[r] = v;
+              this.cf(v < 0, v === 0, 0, 0);
+            } else {
+              this.loc(m, r, 2);
+              this.push(this.ea, 1);
+            }
+          } else if (s >= 2 && m === 0) {
+            d[r] = (s === 2) ? ((d[r] & ~65535) | ((d[r] << 24 >> 24) & 65535)) : (d[r] << 16 >> 16);
+            const w = (s === 2) ? (d[r] << 16 >> 16) : d[r];
+            this.cf(w < 0, w === 0, 0, 0);
+          } else if (s >= 2) {
+            this.movem(op, 0);
+          } else {
+            this.bad(op);
+          }
+          break;
+        }
+
+        if (t === 10) {
+          if (s === 3) {
+            this.loc(m, r, 0);
+            const x = this.get(0);
+            this.cf(x < 0, x === 0, 0, 0);
+            this.put(0, x | 0x80);
+          } else {
+            this.loc(m, r, s);
+            const x = this.get(s);
+            this.cf(x < 0, x === 0, 0, 0);
+          }
+          break;
+        }
+
+        if (t === 12 && s >= 2) {
+          this.movem(op, 1);
+          break;
+        }
+        this.bad(op);
+        break;
+      }
+      case 5: {
+        const s = (op >> 6) & 3;
+        if (s === 3) {
+          const c = (op >> 8) & 15;
+          if (m === 1) {
+            const b = this.pc;
+            const disp = this.fw();
+            if (!this.cc(c)) {
+              const v = ((d[r] & 0xFFFF) - 1) & 0xFFFF;
+              d[r] = (d[r] & ~65535) | v;
+              if (v !== 0xFFFF) this.pc = b + disp;
+            }
+          } else {
+            this.loc(m, r, 0);
+            this.put(0, this.cc(c) ? -1 : 0);
+          }
+          break;
+        }
+        const q = rg || 8;
+        if (m === 1) {
+          a[r] += (op & 0x100) ? -q : q;
+          break;
+        }
+        this.loc(m, r, s);
+        const x = this.get(s);
+        this.put(s, this.alu((op & 0x100) ? 4 : 3, s, x, q));
+        break;
+      }
+      case 6: {
+        let disp = op << 24 >> 24;
+        const b = this.pc;
+        const c = (op >> 8) & 15;
+        if (disp === 0) disp = this.fw();
+        if (c === 1) {
+          this.push(this.pc, 1);
+          this.pc = b + disp;
+        } else if (c === 0 || this.cc(c)) {
+          this.pc = b + disp;
+        }
+        break;
+      }
+      case 7: {
+        const v = op << 24 >> 24;
+        d[rg] = v;
+        this.cf(v < 0, v === 0, 0, 0);
+        break;
+      }
+      case 8:
+      case 9:
+      case 11:
+      case 12:
+      case 13: {
+        const om = (op >> 6) & 7;
+        if (hi === 8 && (om & 3) === 3) {
+          this.loc(m, r, 1);
+          this.div(rg, this.get(1), om === 7);
+          break;
+        }
+        if (hi === 12 && (om & 3) === 3) {
+          this.loc(m, r, 1);
+          const x = this.get(1);
+          const z = (om === 3) ? (d[rg] & 65535) * (x & 65535) : (d[rg] << 16 >> 16) * x;
+          d[rg] = z | 0;
+          this.cf(z < 0, z === 0, 0, 0);
+          break;
+        }
+        if (hi === 12) {
+          const t2 = op & 0x1F8;
+          if (t2 === 0x140 || t2 === 0x148 || t2 === 0x188) {
+            const A = (t2 === 0x148) ? a : d;
+            const B = (t2 === 0x140) ? d : a;
+            const t = A[rg];
+            A[rg] = B[r];
+            B[r] = t;
+            break;
+          }
+        }
+        if ((hi === 9 || hi === 11 || hi === 13) && (om & 3) === 3) {
+          const s = (om === 3) ? 1 : 2;
+          this.loc(m, r, s);
+          const x = this.get(s);
+          if (hi === 11) this.alu(5, 2, a[rg], x);
+          else a[rg] += (hi === 9) ? -x : x;
+          break;
+        }
+        if (om >= 4 && m < 2 && hi !== 11) {
+          const s = om - 4;
+          const rm = m;
+          const ld = q => {
+            if (rm) {
+              this.loc(4, q, s);
+              return this.get(s);
+            }
+            return sx(d[q], s);
+          };
+          const y = ld(r);
+          const x = ld(rg);
+          let v;
+
+          if (hi === 9 || hi === 13) {
+            v = this.xo(hi === 9 ? 1 : 0, s, x, y);
+          } else {
+            const X = (this.sr >> 4) & 1;
+            const ux = x & 255;
+            const uy = y & 255;
+            const sub = (hi === 8);
+            let t = sub ? (ux - uy - X) : (ux + uy + X);
+            let cr = 0;
+
+            if (sub) {
+              if ((ux & 15) - (uy & 15) - X < 0) t -= 6;
+              if (t < 0) { t -= 0x60; cr = 1; }
+            } else {
+              if ((ux & 15) + (uy & 15) + X > 9) t += 6;
+              if (t > 0x99) { t += 0x60; cr = 1; }
+            }
+            v = sx(t & 255, 0);
+            this.sr = (this.sr & 0xFFE0) |
+                      (cr ? 17 : 0) |
+                      (v < 0 ? 8 : 0) |
+                      ((this.sr & 4) && v === 0 ? 4 : 0);
+          }
+          if (!rm) {
+            this.em = 0;
+            this.er = rg;
+          }
+          this.put(s, v);
+          break;
+        }
+        if (hi === 11 && om >= 4 && m === 1) {
+          const s = om - 4;
+          this.loc(3, r, s);
+          const x = this.get(s);
+          this.loc(3, rg, s);
+          this.alu(5, s, this.get(s), x);
+          break;
+        }
+        const k = (hi === 8) ? 0 : (hi === 12) ? 1 : (hi === 9) ? 4 : (hi === 13) ? 3 : (om >= 4) ? 2 : 5;
+        if (om < 3) {
+          this.loc(m, r, om);
+          const x = this.get(om);
+          const v = this.alu(k, om, sx(d[rg], om), x);
+          if (k !== 5) {
+            this.em = 0;
+            this.er = rg;
+            this.put(om, v);
+          }
+        } else {
+          const s = om - 4;
+          this.loc(m, r, s);
+          const x = this.get(s);
+          this.put(s, this.alu(k, s, x, sx(d[rg], s)));
+        }
+        break;
+      }
+      case 14: {
+        const s = (op >> 6) & 3;
+        if (s === 3) {
+          this.loc(m, r, 1);
+          const x = this.get(1);
+          this.put(1, this.sh((op >> 9) & 3, op & 0x100, 1, x, 1));
+          break;
+        }
+        const t = (op >> 3) & 3;
+        const c = (op & 0x20) ? (d[rg] & 63) : (rg || 8);
+        const v = this.sh(t, op & 0x100, s, sx(d[r], s), c);
+        this.em = 0;
+        this.er = r;
+        this.put(s, v);
+        break;
+      }
+      default:
+        this.pc -= 2;
+        this.exc((hi === 10) ? 10 : (hi === 15) ? 11 : 4);
+    }
+    return 12;
+  }
+}
+
+// ==========================================
+// Z80 CPU
+// ==========================================
+const PAR = new Uint8Array(256);
+for (let i = 0; i < 256; i++) {
+  let p = 1;
+  for (let b = 0; b < 8; b++) {
+    if ((i >> b) & 1) p ^= 1;
+  }
+  PAR[i] = p ? 4 : 0;
+}
+
+class Z80 {
+  constructor(b) {
+    this.b = b;
+    this.reset();
+  }
+
+  reset() {
+    this.r = new Uint8Array(8);
+    this.s = new Uint8Array(8);
+    this.f = 0;
+    this.f2 = 0;
+    this.a2 = 0;
+    this.sp = 0xFFFF;
+    this.pc = 0;
+    this.ix = 0;
+    this.iy = 0;
+    this.iff = 0;
+    this.halt = 0;
+    this.irq = 0;
+    this.t = 0;
+    this.cyc = 0;
+    this.bank = 0;
+  }
+
+  rd(a) {
+    this.t += 3;
+    a &= 0xFFFF;
+    if (a < 0x4000) return this.b.z80[a & 0x1FFF];
+    if (a < 0x6000) return this.b.ym.read(a & 3);
+    if (a < 0x8000) return 0xFF;
+    return this.b.read8((this.bank << 15) | (a & 0x7FFF));
+  }
+
+  wr(a, v) {
+    this.t += 3;
+    a &= 0xFFFF;
+    v &= 255;
+    if (a < 0x4000) this.b.z80[a & 0x1FFF] = v;
+    else if (a < 0x6000) this.b.ym.write(a & 3, v);
+    else if (a < 0x6100) this.bank = (this.bank >> 1) | ((v & 1) << 8);
+    else if (a === 0x7F11) this.b.psg.write(v);
+    else if (a >= 0x8000) this.b.write8((this.bank << 15) | (a & 0x7FFF), v);
+  }
+
+  fb() {
+    this.t += 1;
+    const v = this.rd(this.pc);
+    this.pc = (this.pc + 1) & 0xFFFF;
+    return v;
+  }
+
+  fw() {
+    const l = this.fb();
+    return l | (this.fb() << 8);
+  }
+
+  rw(a) {
+    const l = this.rd(a);
+    return l | (this.rd(a + 1) << 8);
+  }
+
+  ww(a, v) {
+    this.wr(a, v);
+    this.wr(a + 1, v >> 8);
+  }
+
+  push(v) {
+    this.sp = (this.sp - 2) & 0xFFFF;
+    this.ww(this.sp, v);
+  }
+
+  pop() {
+    const v = this.rw(this.sp);
+    this.sp = (this.sp + 2) & 0xFFFF;
+    return v;
+  }
+
+  hl() {
+    return (this.r[4] << 8) | this.r[5];
+  }
+
+  sh(v) {
+    this.r[4] = v >> 8;
+    this.r[5] = v;
+  }
+
+  rp(i) {
+    const r = this.r;
+    return (i === 0) ? ((r[0] << 8) | r[1]) :
+           (i === 1) ? ((r[2] << 8) | r[3]) :
+           (i === 2) ? ((r[4] << 8) | r[5]) : this.sp;
+  }
+
+  srp(i, v) {
+    const r = this.r;
+    v &= 0xFFFF;
+    if (i === 0) { r[0] = v >> 8; r[1] = v; }
+    else if (i === 1) { r[2] = v >> 8; r[3] = v; }
+    else if (i === 2) { r[4] = v >> 8; r[5] = v; }
+    else this.sp = v;
+  }
+
+  mem(px) {
+    return px ? ((this.hl() + (this.fb() << 24 >> 24)) & 0xFFFF) : this.hl();
+  }
+
+  cc(i) {
+    return ((this.f & [64, 64, 1, 1, 4, 4, 128, 128][i]) ? 1 : 0) === (i & 1);
+  }
+
+  jr(d) {
+    this.pc = (this.pc + d) & 0xFFFF;
+    this.t += 5;
+  }
+
+  alu(o, v) {
+    const a = this.r[7];
+    const c = this.f & 1;
+    let r, f;
+
+    if (o < 2) {
+      const k = o & c;
+      r = a + v + k;
+      f = (((a & 15) + (v & 15) + k > 15) ? 16 : 0) |
+          ((((a ^ r) & (v ^ r) & 128)) ? 4 : 0) |
+          ((r > 255) ? 1 : 0);
+    } else if (o === 2 || o === 3 || o === 7) {
+      const k = (o === 3) ? c : 0;
+      r = a - v - k;
+      f = 2 |
+          (((a & 15) - (v & 15) - k < 0) ? 16 : 0) |
+          ((((a ^ v) & (a ^ r) & 128)) ? 4 : 0) |
+          ((r < 0) ? 1 : 0);
+    } else {
+      r = (o === 4) ? (a & v) : (o === 5) ? (a ^ v) : (a | v);
+      f = ((o === 4) ? 16 : 0) | PAR[r & 255];
+    }
+    r &= 255;
+    f |= (r & 128) | (r === 0 ? 64 : 0);
+    if (o !== 7) this.r[7] = r;
+    this.f = f;
+  }
+
+  inc(v, d) {
+    const r = (v + d) & 255;
+    this.f = (this.f & 1) |
+             (r & 128) |
+             (r === 0 ? 64 : 0) |
+             ((d > 0) ?
+               (((v & 15) === 15 ? 16 : 0) | (v === 127 ? 4 : 0)) :
+               (2 | ((v & 15) === 0 ? 16 : 0) | (v === 128 ? 4 : 0)));
+    return r;
+  }
+
+  sf(y, v) {
+    let c, r;
+    switch (y) {
+      case 0: c = v >> 7; r = (v << 1) | c; break;
+      case 1: c = v & 1;  r = (v >> 1) | (c << 7); break;
+      case 2: c = v >> 7; r = (v << 1) | (this.f & 1); break;
+      case 3: c = v & 1;  r = (v >> 1) | ((this.f & 1) << 7); break;
+      case 4: c = v >> 7; r = v << 1; break;
+      case 5: c = v & 1;  r = (v >> 1) | (v & 128); break;
+      case 6: c = v >> 7; r = (v << 1) | 1; break;
+      default: c = v & 1; r = v >> 1;
+    }
+    r &= 255;
+    this.f = c | (r & 128) | (r === 0 ? 64 : 0) | PAR[r];
+    return r;
+  }
+
+  daa() {
+    const a = this.r[7];
+    const f = this.f;
+    const n = f & 2;
+    let t = 0;
+    let c = f & 1;
+
+    if ((f & 16) || (a & 15) > 9) t = 6;
+    if (c || a > 0x99) {
+      t |= 0x60;
+      c = 1;
+    }
+    const v = (n ? (a - t) : (a + t)) & 255;
+    this.r[7] = v;
+    this.f = c | n | PAR[v] | (v & 128) | (v ? 0 : 64) |
+             (n ? (((f & 16) && (a & 15) < 6) ? 16 : 0) : (((a & 15) > 9) ? 16 : 0));
+  }
+
+  add16(a, b) {
+    const r = a + b;
+    this.f = (this.f & 0xC4) |
+             (((a & 0xFFF) + (b & 0xFFF) > 0xFFF) ? 16 : 0) |
+             ((r > 0xFFFF) ? 1 : 0);
+    return r & 0xFFFF;
+  }
+
+  adc16(a, b, sb) {
+    const c = this.f & 1;
+    const r = sb ? (a - b - c) : (a + b + c);
+    const rr = r & 0xFFFF;
+
+    this.f = (rr & 0x8000 ? 128 : 0) |
+             (rr ? 0 : 64) |
+             (sb ?
+               (2 | (((a & 0xFFF) - (b & 0xFFF) - c < 0) ? 16 : 0) | (((a ^ b) & (a ^ rr) & 0x8000) ? 4 : 0) | (r < 0 ? 1 : 0)) :
+               ((((a & 0xFFF) + (b & 0xFFF) + c > 0xFFF) ? 16 : 0) | (((a ^ rr) & (b ^ rr) & 0x8000) ? 4 : 0) | (r > 0xFFFF ? 1 : 0)));
+    return rr;
+  }
+
+  cb(px) {
+    const r = this.r;
+    let e = -1;
+    if (px) e = this.mem(px);
+    const op = this.fb();
+    const x = op >> 6;
+    const y = (op >> 3) & 7;
+    const z = op & 7;
+
+    if (!px && z === 6) e = this.hl();
+    const mm = e >= 0;
+    const v = mm ? this.rd(e) : r[z];
+
+    if (x === 1) {
+      const b = (v >> y) & 1;
+      this.f = (this.f & 1) | 16 | (b ? 0 : 68) | ((y === 7 && b) ? 128 : 0);
+      return;
+    }
+
+    const n = (x === 0) ? this.sf(y, v) :
+              (x === 2) ? (v & ~(1 << y)) : (v | (1 << y));
+    if (mm) this.wr(e, n);
+    else r[z] = n;
+  }
+
+  ed() {
+    const r = this.r;
+    const op = this.fb();
+    const y = (op >> 3) & 7;
+    const p = y >> 1;
+    const q = y & 1;
+
+    if (op === 0x44) {
+      const a = r[7];
+      r[7] = 0;
+      this.alu(2, a);
+    } else if (op === 0x4D || op === 0x45) {
+      this.pc = this.pop();
+      this.iff = 1;
+    } else if ((op & 0xC7) === 0x42) {
+      this.srp(2, this.adc16(this.hl(), this.rp(p), q === 0));
+    } else if ((op & 0xC7) === 0x43) {
+      const n = this.fw();
+      if (!q) this.ww(n, this.rp(p));
+      else this.srp(p, this.rw(n));
+    } else if (op >= 0xA0 && op < 0xC0 && (op & 4) === 0) {
+      const d = (op & 8) ? -1 : 1;
+      const hl = this.hl();
+      const de = (r[2] << 8) | r[3];
+      let bc = (r[0] << 8) | r[1];
+
+      this.wr(de, this.rd(hl));
+      this.sh(hl + d);
+      this.srp(1, de + d);
+      bc = (bc - 1) & 0xFFFF;
+      this.srp(0, bc);
+      this.f = (this.f & 0xC1) | (bc ? 4 : 0);
+
+      if ((op & 0x10) && bc) {
+        this.pc = (this.pc - 2) & 0xFFFF;
+        this.t += 5;
+      }
+    }
+  }
+
+  step() {
+    this.t = 0;
+    if (this.irq && this.iff) {
+      this.iff = 0;
+      this.halt = 0;
+      this.push(this.pc);
+      this.pc = 0x38;
+      this.t += 13;
+      return this.t;
+    }
+    if (this.halt) return 4;
+
+    let op = this.fb();
+    let px = 0;
+    while (op === 0xDD || op === 0xFD) {
+      px = op;
+      op = this.fb();
+    }
+
+    if (px) {
+      const t = (px === 0xDD) ? this.ix : this.iy;
+      if (px === 0xDD) this.ix = this.hl();
+      else this.iy = this.hl();
+      this.sh(t);
+    }
+
+    this.ex(op, px);
+
+    if (px) {
+      const t = this.hl();
+      if (px === 0xDD) {
+        this.sh(this.ix);
+        this.ix = t;
+      } else {
+        this.sh(this.iy);
+        this.iy = t;
+      }
+    }
+    return this.t || 4;
+  }
+
+  ex(op, px) {
+    const r = this.r;
+    const x = op >> 6;
+    const y = (op >> 3) & 7;
+    const z = op & 7;
+    const p = y >> 1;
+    const q = y & 1;
+    let e = -1;
+
+    const M = () => (e < 0) ? (e = this.mem(px)) : e;
+    const G = i => (i === 6) ? this.rd(M()) : r[i];
+    const S = (i, v) => {
+      if (i === 6) this.wr(M(), v);
+      else r[i] = v;
+    };
+
+    if (x === 1) {
+      if (op === 0x76) {
+        this.halt = 1;
+        return;
+      }
+      S(y, G(z));
+      return;
+    }
+
+    if (x === 2) {
+      this.alu(y, G(z));
+      return;
+    }
+
+    if (x === 0) {
+      switch (z) {
+        case 0:
+          if (y === 0) return;
+          if (y === 1) {
+            let t = r[7];
+            r[7] = this.a2;
+            this.a2 = t;
+            t = this.f;
+            this.f = this.f2;
+            this.f2 = t;
+            return;
+          }
+          {
+            const d = this.fb() << 24 >> 24;
+            if (y === 2) {
+              r[0] = (r[0] - 1) & 255;
+              if (r[0]) this.jr(d);
+            } else if (y === 3 || this.cc(y - 4)) {
+              this.jr(d);
+            }
+          }
+          return;
+        case 1:
+          if (!q) this.srp(p, this.fw());
+          else this.srp(2, this.add16(this.hl(), this.rp(p)));
+          return;
+        case 2:
+          if (p < 2) {
+            const a = this.rp(p);
+            if (!q) this.wr(a, r[7]);
+            else r[7] = this.rd(a);
+          } else {
+            const a = this.fw();
+            if (p === 2) {
+              if (!q) this.ww(a, this.hl());
+              else this.sh(this.rw(a));
+            } else if (!q) {
+              this.wr(a, r[7]);
+            } else {
+              r[7] = this.rd(a);
+            }
+          }
+          return;
+        case 3:
+          this.srp(p, this.rp(p) + (q ? -1 : 1));
+          this.t += 2;
+          return;
+        case 4:
+          S(y, this.inc(G(y), 1));
+          return;
+        case 5:
+          S(y, this.inc(G(y), -1));
+          return;
+        case 6:
+          if (y === 6) M();
+          S(y, this.fb());
+          return;
+        default: {
+          const a = r[7];
+          const o = this.f;
+          if (y < 4) {
+            r[7] = this.sf(y, a);
+            this.f = (o & 0xC4) | (this.f & 1);
+          } else if (y === 4) {
+            this.daa();
+          } else if (y === 5) {
+            r[7] = ~a;
+            this.f = o | 0x12;
+          } else if (y === 6) {
+            this.f = (o & 0xC4) | 1;
+          } else {
+            this.f = (o & 0xC4) | (o & 1 ? 16 : 1);
+          }
+          return;
+        }
+      }
+    }
+
+    switch (z) {
+      case 0:
+        this.t += 1;
+        if (this.cc(y)) this.pc = this.pop();
+        return;
+      case 1:
+        if (!q) {
+          const v = this.pop();
+          if (p === 0) this.srp(0, v);
+          else if (p === 1) this.srp(1, v);
+          else if (p === 2) this.sh(v);
+          else {
+            r[7] = v >> 8;
+            this.f = v & 255;
+          }
+        } else if (p === 0) {
+          this.pc = this.pop();
+        } else if (p === 1) {
+          for (let i = 0; i < 6; i++) {
+            const t = r[i];
+            r[i] = this.s[i];
+            this.s[i] = t;
+          }
+        } else if (p === 2) {
+          this.pc = this.hl();
+        } else {
+          this.sp = this.hl();
+        }
+        return;
+      case 2: {
+        const n = this.fw();
+        if (this.cc(y)) this.pc = n;
+        return;
+      }
+      case 3:
+        switch (y) {
+          case 0: this.pc = this.fw(); return;
+          case 1: this.cb(px); return;
+          case 2: this.fb(); return;
+          case 3: this.fb(); r[7] = 0xFF; return;
+          case 4: {
+            const t = this.rw(this.sp);
+            this.ww(this.sp, this.hl());
+            this.sh(t);
+            return;
+          }
+          case 5: {
+            const d = (r[2] << 8) | r[3];
+            r[2] = r[4];
+            r[3] = r[5];
+            this.sh(d);
+            return;
+          }
+          case 6: this.iff = 0; return;
+          default: this.iff = 1; return;
+        }
+      case 4: {
+        const n = this.fw();
+        if (this.cc(y)) {
+          this.push(this.pc);
+          this.pc = n;
+        }
+        return;
+      }
+      case 5:
+        if (!q) {
+          this.push(p === 3 ? ((r[7] << 8) | this.f) : p === 2 ? this.hl() : this.rp(p));
+        } else if (p === 0) {
+          const n = this.fw();
+          this.push(this.pc);
+          this.pc = n;
+        } else if (p === 2) {
+          this.ed();
+        }
+        return;
+      case 6:
+        this.alu(y, this.fb());
+        return;
+      default:
+        this.push(this.pc);
+        this.pc = y * 8;
+    }
+  }
+}
+
+// ==========================================
+// PSG (SN76489)
+// ==========================================
+class PSG {
+  constructor() {
+    this.sr = 48000;
+    this.reset();
+  }
+
+  reset() {
+    this.tone = [0, 0, 0, 0];
+    this.vol = [15, 15, 15, 15];
+    this.cnt = [1, 1, 1, 1];
+    this.out = [1, 1, 1, 1];
+    this.lfsr = 0x8000;
+    this.latch = 0;
+  }
+
+  write(v) {
+    if (v & 0x80) {
+      this.latch = (v >> 4) & 7;
+      const c = this.latch >> 1;
+      if (this.latch & 1) {
+        this.vol[c] = v & 15;
+      } else {
+        this.tone[c] = (this.tone[c] & 0x3F0) | (v & 15);
+        if (c === 3) this.lfsr = 0x8000;
+      }
+    } else {
+      const c = this.latch >> 1;
+      if (this.latch & 1) {
+        this.vol[c] = v & 15;
+      } else if (c < 3) {
+        this.tone[c] = (this.tone[c] & 15) | ((v & 0x3F) << 4);
+      }
+    }
+  }
+
+  gen() {
+    let o = 0;
+    const k = 223721 / this.sr;
+
+    for (let c = 0; c < 4; c++) {
+      const t = this.tone[c];
+      const p = (c < 3) ? t : [16, 32, 64, this.tone[2]][t & 3];
+      this.cnt[c] -= k;
+
+      while (this.cnt[c] <= 0) {
+        this.cnt[c] += Math.max(p, 1);
+        this.out[c] ^= 1;
+        if (c === 3 && this.out[3]) {
+          const fb = (t & 4) ? ((this.lfsr & 1) ^ ((this.lfsr >> 3) & 1)) : (this.lfsr & 1);
+          this.lfsr = (this.lfsr >> 1) | (fb << 15);
+        }
+      }
+
+      const v = this.vol[c];
+      if (v < 15) {
+        const g = Math.pow(10, -v * 0.1);
+        const b = (c === 3) ? (this.lfsr & 1) : this.out[c];
+        o += b ? g : -g;
+      }
+    }
+    return o * 0.12;
+  }
+}
+
+// ==========================================
+// YM2612 (FM Synthesizer)
+// ==========================================
+const RT = Array.from({ length: 64 }, (_, x) => x ? Math.pow(2, x / 4) * 5e-5 : 0);
+const OFF = [0, 8, 4, 12];
+
+class YM {
+  constructor() {
+    this.sr = 48000;
+    this.reset();
+  }
+
+  reset() {
+    this.reg = [new Uint8Array(256), new Uint8Array(256)];
+    for (let i = 0; i < 3; i++) {
+      this.reg[0][0xB4 + i] = this.reg[1][0xB4 + i] = 0xC0;
+    }
+    this.ph = new Float64Array(24);
+    this.att = new Float64Array(24).fill(1023);
+    this.st = new Uint8Array(24);
+    this.key = new Uint8Array(24);
+    this.o1 = new Float64Array(12);
+    this.addr = 0;
+    this.part = 0;
+    this.dac = 128;
+    this.dacOn = 0;
+    this.status = 0;
+    this.ta = 0;
+    this.tb = 0;
+    this.ca = 0;
+    this.cb = 0;
+    this.mode = 0;
+    this.l = 0;
+    this.r = 0;
+  }
+
+  read(p) {
+    return this.status;
+  }
+
+  write(p, v) {
+    if (!(p & 1)) {
+      this.addr = v;
+      this.part = p >> 1;
+      return;
+    }
+    this.set(this.part, this.addr, v);
+  }
+
+  set(pt, a, v) {
+    this.reg[pt][a] = v;
+    if (pt) return;
+
+    if (a === 0x24 || a === 0x25) {
+      this.ta = (this.reg[0][0x24] << 2) | (this.reg[0][0x25] & 3);
+    } else if (a === 0x26) {
+      this.tb = v;
+    } else if (a === 0x27) {
+      const o = this.mode;
+      this.mode = v;
+      if (v & 0x10) this.status &= ~1;
+      if (v & 0x20) this.status &= ~2;
+      if ((v & 1) && !(o & 1)) this.ca = 1024 - this.ta;
+      if ((v & 2) && !(o & 2)) this.cb = 16 * (256 - this.tb);
+    } else if (a === 0x28) {
+      const ch = v & 7;
+      if (ch === 3 || ch === 7) return;
+      const c = (ch > 3) ? (ch - 1) : ch;
+      for (let k = 0; k < 4; k++) {
+        const s = c * 4 + k;
+        if ((v >> (4 + k)) & 1) {
+          if (!this.key[s]) {
+            this.key[s] = 1;
+            this.st[s] = 0;
+            this.ph[s] = 0;
+          }
+        } else {
+          this.key[s] = 0;
+        }
+      }
+    } else if (a === 0x2A) {
+      this.dac = v;
+    } else if (a === 0x2B) {
+      this.dacOn = v >> 7;
+    }
+  }
+
+  timer(n) {
+    if (this.mode & 1) {
+      this.ca -= n;
+      while (this.ca <= 0) {
+        this.ca += 1024 - this.ta;
+        if (this.mode & 4) this.status |= 1;
+      }
+    }
+    if (this.mode & 2) {
+      this.cb -= n;
+      while (this.cb <= 0) {
+        this.cb += 16 * (256 - this.tb);
+        if (this.mode & 8) this.status |= 2;
+      }
+    }
+  }
+
+  op(c, k, R, i, fq, m) {
+    const s = c * 4 + k;
+    const off = i + OFF[k];
+    const mul = R[0x30 + off] & 15;
+    const tl = R[0x40 + off] & 127;
+    const ar = R[0x50 + off] & 31;
+    const d1 = R[0x60 + off] & 31;
+    const d2 = R[0x70 + off] & 31;
+    const sl = R[0x80 + off] >> 4;
+    const rr = R[0x80 + off] & 15;
+
+    this.ph[s] = (this.ph[s] + fq * (mul || 0.5)) % 1;
+    let a = this.att[s];
+    let st = this.st[s];
+
+    if (this.key[s]) {
+      if (st === 0) {
+        if (ar >= 30) a = 0;
+        else if (ar) a -= (a * 0.04 + 1) * RT[ar * 2] * 3;
+        if (a <= 0) { a = 0; st = 1; }
+      } else if (st === 1) {
+        a += RT[d1 * 2];
+        if (a >= (sl === 15 ? 992 : sl * 32)) st = 2;
+      } else {
+        a += RT[d2 * 2];
+      }
+    } else {
+      a += RT[rr * 4 + 2];
+    }
+
+    if (a > 1023) a = 1023;
+    this.att[s] = a;
+    this.st[s] = st;
+
+    return (a >= 1023) ? 0 : Math.sin(6.2831853 * (this.ph[s] + m * 4)) * Math.pow(2, -(a + tl * 8) / 64);
+  }
+
+  gen() {
+    let L = 0;
+    let Rr = 0;
+
+    for (let c = 0; c < 6; c++) {
+      const pt = (c < 3) ? 0 : 1;
+      const i = c % 3;
+      const R = this.reg[pt];
+      const pan = R[0xB4 + i];
+      let o;
+
+      if (c === 5 && this.dacOn) {
+        o = (this.dac - 128) / 128 * 0.9;
+      } else {
+        const fn = ((R[0xA4 + i] & 7) << 8) | R[0xA0 + i];
+        const bl = (R[0xA4 + i] >> 3) & 7;
+        const al = R[0xB0 + i] & 7;
+        const fb = (R[0xB0 + i] >> 3) & 7;
+        const fq = fn * (1 << bl) / 2097152 * (53267 / this.sr);
+        const q = c * 2;
+
+        const o1 = this.op(c, 0, R, i, fq, fb ? (this.o1[q] + this.o1[q + 1]) * Math.pow(2, fb - 6) : 0);
+        this.o1[q + 1] = this.o1[q];
+        this.o1[q] = o1;
+
+        const O = (k, m) => this.op(c, k, R, i, fq, m);
+        let o2, o3, o4;
+
+        switch (al) {
+          case 0: o2 = O(1, o1); o3 = O(2, o2); o = O(3, o3); break;
+          case 1: o2 = O(1, 0); o3 = O(2, o1 + o2); o = O(3, o3); break;
+          case 2: o2 = O(1, 0); o3 = O(2, o2); o = O(3, o1 + o3); break;
+          case 3: o2 = O(1, o1); o3 = O(2, 0); o = O(3, o2 + o3); break;
+          case 4: o2 = O(1, o1); o3 = O(2, 0); o4 = O(3, o3); o = o2 + o4; break;
+          case 5: o2 = O(1, o1); o3 = O(2, o1); o4 = O(3, o1); o = o2 + o3 + o4; break;
+          case 6: o2 = O(1, o1); o3 = O(2, 0); o4 = O(3, 0); o = o2 + o3 + o4; break;
+          default: o2 = O(1, 0); o3 = O(2, 0); o4 = O(3, 0); o = o1 + o2 + o3 + o4;
+        }
+        o *= 0.35;
+      }
+      if (pan & 0x80) L += o;
+      if (pan & 0x40) Rr += o;
+    }
+    this.l = L * 0.4;
+    this.r = Rr * 0.4;
+  }
+}
+
+// ==========================================
+// Main Application / Driver
+// ==========================================
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const img = ctx.createImageData(320, 224);
+const buf = new Uint32Array(img.data.buffer);
+
+const vdp = new VDP();
+const bus = new Bus(vdp);
+const cpu = new M68K(bus);
+const info = document.getElementById("info");
+
+let running = false;
+let err = "";
+
+function show() {
+  buf.set(vdp.fb);
+  ctx.putImageData(img, 0, 0);
+}
+
+function header(rom) {
+  const t = (a, n) => new TextDecoder("ascii").decode(rom.slice(a, a + n)).trim();
+  return `システム: ${t(0x100, 16)}
+国内名: ${t(0x120, 48)}
+海外名: ${t(0x150, 48)}
+サイズ: ${rom.length} bytes
+SP=$${bus.read32(0).toString(16)} PC=$${bus.read32(4).toString(16)}`;
+}
+
+async function load(f) {
+  bus.saveSram();
+  let d = new Uint8Array(await f.arrayBuffer());
+
+  // SMD形式判定・変換
+  if (d.length % 512 === 512 % 512 && d.length % 16384 === 512 && d[8] === 0xAA && d[9] === 0xBB) {
+    d = smd(d);
+  }
+
+  bus.rom = d;
+  bus.initRom();
+  bus.zrst = 0;
+  z80.reset();
+  bus.ym.reset();
+  bus.psg.reset();
+
+  startAudio();
+
+  vdp.vram.fill(0);
+  vdp.cram.fill(0);
+  vdp.vsram.fill(0);
+  vdp.reg.fill(0);
+  vdp.pend = false;
+
+  cpu.reset();
+  err = "";
+  //info.textContent = header(d) + (bus.sramOn ? "\nSRAM: 有効(localStorageに自動保存)" : "");
+  running = true;
+}
+
+document.getElementById("rom").onchange = e => e.target.files[0] && load(e.target.files[0]);
+addEventListener("dragover", e => e.preventDefault());
+addEventListener("drop", e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f) load(f);
+});
+addEventListener("pagehide", () => bus.saveSram());
+
+function smd(d) {
+  const out = new Uint8Array((d.length - 512) / 16384 * 16384);
+  let o = 0;
+  for (let b = 512; b < d.length; b += 16384) {
+    for (let i = 0; i < 8192; i++) {
+      out[o + i * 2 + 1] = d[b + i];
+      out[o + i * 2] = d[b + 8192 + i];
+    }
+    o += 16384;
+  }
+  return out;
+}
+
+document.getElementById("rst").onclick = () => {
+  if (bus.rom.length) {
+    cpu.reset();
+    err = "";
+    running = true;
+  }
+};
+
+
+// 入力処理: ビット0=Up 1=Down 2=Left 3=Right 4=B 5=C / 6=A 7=Start (0=押下)
+const keys = {
+  ArrowUp: 0,
+  ArrowDown: 1,
+  ArrowLeft: 2,
+  ArrowRight: 3,
+  z: 4,
+  x: 5,
+  c: 6,
+  Enter: 7,
+  a: 8,
+  s: 9,
+  d: 10,
+  q: 11
+};
+
+let kb = 0xFFF;
+let gp = 0xFFF;
+
+addEventListener("keydown", e => {
+  if (e.key in keys) {
+    kb &= ~(1 << keys[e.key]);
+    e.preventDefault();
+  }
+});
+
+addEventListener("keyup", e => {
+  if (e.key in keys) {
+    kb |= (1 << keys[e.key]);
+  }
+});
+
+// メインループ: NTSC 約7.67MHz/60fps ≒ 127k cycles/frame
+let hc = 0;
+
+function runFrame() {
+  const r = vdp.reg;
+  bus.cnt = [0, 0];
+
+  for (let ln = 0; ln < 262; ln++) {
+    vdp.line = ln;
+
+    if (ln === 0) {
+      vdp.status &= ~0x88;
+      hc = r[10];
+    }
+    if (ln === 224) {
+      vdp.status |= 0x88;
+      if (r[1] & 0x20) cpu.irq = 6;
+    }
+    if (ln < 224 && hc-- <= 0) {
+      hc = r[10];
+      if ((r[0] & 0x10) && cpu.irq < 4) cpu.irq = 4;
+    }
+
+    for (let c = 0; c < 488; ) {
+      c += cpu.step();
+    }
+    audioLine(ln);
+  }
+}
+
+const z80 = new Z80(bus);
+bus.zcpu = z80;
+
+let acc = 0;
+let actx = null;
+let sr = 48000;
+let rw = 0;
+let rr = 0;
+const ring = [new Float32Array(16384), new Float32Array(16384)];
+
+function audioLine(ln) {
+  if (ln === 224) z80.irq = 1;
+  else if (ln === 225) z80.irq = 0;
+
+  if (bus.zrst && !bus.busreq) {
+    z80.cyc += 228;
+    while (z80.cyc > 0) z80.cyc -= z80.step();
+  } else {
+    z80.cyc = 0;
+  }
+
+  bus.ym.timer(3.39);
+  acc += sr / 15720;
+  const n = acc | 0;
+  acc -= n;
+
+  for (let i = 0; i < n; i++) {
+    bus.ym.gen();
+    const p = bus.psg.gen();
+    const L = bus.ym.l + p;
+    const R = bus.ym.r + p;
+
+    if (actx && (rw - rr < 8192)) {
+      ring[0][rw & 16383] = L;
+      ring[1][rw & 16383] = R;
+      rw++;
+    }
+  }
+}
+
+function startAudio() {
+  if (!actx) {
+    try {
+      actx = new AudioContext();
+      sr = actx.sampleRate;
+      bus.ym.sr = bus.psg.sr = sr;
+
+      const n = actx.createScriptProcessor(2048, 0, 2);
+      n.onaudioprocess = e => {
+        const a = e.outputBuffer.getChannelData(0);
+        const b = e.outputBuffer.getChannelData(1);
+        for (let i = 0; i < a.length; i++) {
+          if (rr < rw) {
+            a[i] = ring[0][rr & 16383];
+            b[i] = ring[1][rr & 16383];
+            rr++;
+          } else {
+            a[i] = b[i] = 0;
+          }
+        }
+      };
+      n.connect(actx.destination);
+    } catch (e) {
+      actx = null;
+    }
+  }
+  if (actx && actx.state !== "running") {
+    actx.resume();
+  }
+}
+
+["keydown", "pointerdown"].forEach(t => addEventListener(t, startAudio));
+
+let fc = 0;
+const gmap = [
+  [0, 4], [1, 5], [2, 6], [3, 10], [9, 7],
+  [12, 0], [13, 1], [14, 2], [15, 3], [4, 9], [5, 8]
+];
+
+function pollPad() {
+  gp = 0xFFF;
+  try {
+    const g = (navigator.getGamepads ? navigator.getGamepads() : [])[0];
+    if (g) {
+      for (const [b, k] of gmap) {
+        if (g.buttons[b] && g.buttons[b].pressed) {
+          gp &= ~(1 << k);
+        }
+      }
+    }
+  } catch (e) {}
+  bus.pad = kb & gp;
+}
+
+function frame() {
+  pollPad();
+  if (++fc % 120 === 0) bus.saveSram();
+
+  if (running) {
+    try {
+      runFrame();
+    } catch (e) {
+      running = false;
+      err = e.message;
+      info.textContent += "\n\n停止: " + err;
+    }
+    vdp.renderFrame();
+    show();
+  }
+  requestAnimationFrame(frame);
+}
+
+frame();
+</script>
+</main>
+</body>
+</html>
