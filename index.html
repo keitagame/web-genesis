@@ -2831,9 +2831,12 @@ const Cloud = (() => {
   // ---------- API ----------
   async function api(path, opt = {}) {
     const headers = Object.assign({}, opt.headers);
-    if (token) headers.Authorization = "Bearer " + token;
+    if (token) headers["X-Auth-Token"] = token;   // Authorizationはサーバーによって届かないことがある
     const res = await fetch(API + path, Object.assign({}, opt, { headers }));
-    if (res.status === 401 && token) setToken("");   // 期限切れ → ログアウト扱い
+    if (res.status === 401 && token) {   // 期限切れ → ログアウト扱い
+      setToken("");
+      note("ログインが無効になりました (期限切れ、または認証情報がサーバーに届いていません)");
+    }
     return res;
   }
 
