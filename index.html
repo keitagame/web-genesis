@@ -134,6 +134,57 @@ h1.title-main {
 .info-text {
   font-size: 14px;
 }
+
+/* ---- ポータル連携 ---- */
+[hidden] { display: none !important; }
+a { color: #00ffcc; }
+.text-input {
+  font-family: "DotGothic16", sans-serif;
+  background: black;
+  color: white;
+  border: 1px solid white;
+  border-radius: 0;
+  padding: 8px 10px;
+  font-size: 13px;
+  outline: none;
+}
+.avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  vertical-align: middle;
+  background: #222;
+}
+.check {
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+#msg { min-height: 1.6em; padding: 4px 10px; color: #00ffcc; font-size: 13px; }
+dialog {
+  background: black;
+  color: white;
+  border: 1px solid white;
+  border-radius: 0;
+  padding: 16px;
+  width: min(560px, 92vw);
+  font-family: "DotGothic16", sans-serif;
+  font-size: 13px;
+}
+dialog::backdrop { background: rgba(0, 0, 0, .7); }
+dialog textarea { width: 100%; margin-top: 8px; }
+.code { font-size: 28px; letter-spacing: .15em; margin: 8px 0; }
+#bbs-out {
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border: 1px solid #333;
+  padding: 8px;
+  margin: 8px 0;
+}
   </style>
 </head>
 <body>
@@ -144,11 +195,47 @@ h1.title-main {
       <li><label class="upload-label"><input type="file" id="rom" class="hidden-input" accept=".bin,.md,.gen,.smd">genを選択</label></li>
       
       <li><button class="button" id="rst">リセット</button></li>
+      <li id="acct">
+        <button class="button" id="login">ログイン</button>
+        <span id="user" hidden><img class="avatar" id="ava" alt=""> <span id="uname"></span> <button class="button" id="logout">ログアウト</button></span>
+      </li>
+      <li><select class="select-box" id="slot" title="クラウドのスロット">
+        <option value="1">スロット1</option><option value="2">スロット2</option><option value="3">スロット3</option>
+        <option value="4">スロット4</option><option value="5">スロット5</option><option value="6">スロット6</option>
+        <option value="7">スロット7</option><option value="8">スロット8</option><option value="9">スロット9</option>
+      </select></li>
+      <li><button class="button" id="csave" disabled>クラウドセーブ</button></li>
+      <li><button class="button" id="cload" disabled>クラウドロード</button></li>
+      <li><label class="check"><input type="checkbox" id="pub" checked> プレイ状況を公開</label></li>
+      <li><button class="button" id="bbs">掲示板</button></li>
      
       
       </ul>
   </nav>
 </header>
+<div id="msg" role="status"></div>
+
+<dialog id="dlg-login">
+  <p>ブラウザでログインして、次のコードを承認してください。</p>
+  <p class="code" id="login-code">…</p>
+  <p><a id="login-link" target="_blank" rel="noopener" hidden>ログインページを開く</a></p>
+  <p id="login-msg"></p>
+  <button type="button" class="button" id="login-cancel">キャンセル</button>
+</dialog>
+
+<dialog id="dlg-bbs">
+  <div>
+    <button type="button" class="button" id="bbs-list">スレッド一覧</button>
+    <input class="text-input" id="bbs-thread" placeholder="スレッドID" size="14" autocomplete="off">
+    <button type="button" class="button" id="bbs-read">読む</button>
+  </div>
+  <pre id="bbs-out"></pre>
+  <textarea class="text-input" id="bbs-msg" rows="3" maxlength="1000" placeholder="本文 (1000文字まで)"></textarea>
+  <div>
+    <button type="button" class="button" id="bbs-post">投稿</button>
+    <button type="button" class="button" id="bbs-close">閉じる</button>
+  </div>
+</dialog>
 <div class="main">
   <canvas id="c" width="320" height="224"></canvas>
   </div>
@@ -2468,6 +2555,7 @@ async function load(f) {
     d = smd(d);
   }
 
+  const gid = await Cloud.romId(d);   // 同じROMなら全端末で同じID
   bus.rom = d;
   bus.initRom();
   bus.zrst = 0;
@@ -2485,6 +2573,7 @@ async function load(f) {
 
   cpu.reset();
   err = "";
+  Cloud.onRomLoaded(gid, Cloud.romTitle(d, f.name));
   //info.textContent = header(d) + (bus.sramOn ? "\nSRAM: 有効(localStorageに自動保存)" : "");
   running = true;
 }
@@ -2540,6 +2629,8 @@ let kb = 0xFFF;
 let gp = 0xFFF;
 
 addEventListener("keydown", e => {
+  // 入力欄・選択欄・ダイアログ内の操作はゲーム入力にしない
+  if (e.target instanceof Element && e.target.closest("input, textarea, select, dialog")) return;
   if (e.key in keys) {
     kb &= ~(1 << keys[e.key]);
     e.preventDefault();
@@ -2712,6 +2803,399 @@ function frame(t) {
   }
   requestAnimationFrame(frame);
 }
+
+// ==========================================
+// ポータル連携 (ログイン / アイコン / クラウドセーブ / プレイ状況 / 掲示板)
+// ==========================================
+const Cloud = (() => {
+  // ★ ポータルAPIのURL (index.php まで。末尾スラッシュなし)
+  const API = "https://example.com/emu/index.php";
+  const FORMAT = "genstate-v1";
+
+  const $ = id => document.getElementById(id);
+  const note = t => { $("msg").textContent = t; };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const ls = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+    del(k) { try { localStorage.removeItem(k); } catch (e) {} },
+  };
+
+  let token = ls.get("gen_token") || "";
+  let game = "";
+  let title = "";
+  let hb = 0;
+  let avaUrl = "";
+  let loginCtl = null;
+
+  // ---------- API ----------
+  async function api(path, opt = {}) {
+    const headers = Object.assign({}, opt.headers);
+    if (token) headers.Authorization = "Bearer " + token;
+    const res = await fetch(API + path, Object.assign({}, opt, { headers }));
+    if (res.status === 401 && token) setToken("");   // 期限切れ → ログアウト扱い
+    return res;
+  }
+
+  // ---------- ゲーム識別 ----------
+  // 同じROMなら全端末で同じIDになるよう、ROM内容のSHA-256先頭128bitを使う
+  async function romId(rom) {
+    try {
+      const h = new Uint8Array(await crypto.subtle.digest("SHA-256", rom));
+      return "gen-" + Array.from(h.slice(0, 16), b => b.toString(16).padStart(2, "0")).join("");
+    } catch (e) {
+      // http等でcrypto.subtleが無い場合の代替(FNV-1a)。https配信を推奨
+      let x = 2166136261;
+      for (let i = 0; i < rom.length; i++) x = Math.imul(x ^ rom[i], 16777619) >>> 0;
+      return "gen-f" + x.toString(16).padStart(8, "0") + rom.length.toString(16);
+    }
+  }
+
+  function romTitle(d, fname) {
+    const t = a => new TextDecoder("ascii").decode(d.subarray(a, a + 48))
+      .replace(/[^\x20-\x7E]/g, "").replace(/\s+/g, " ").trim();
+    return (t(0x150) || t(0x120) || String(fname || "").replace(/\.[^.]+$/, "")).slice(0, 100) || "Unknown";
+  }
+
+  // ---------- ステート (レジスタ・メモリ) のシリアライズ ----------
+  // 形式: "GSV1" + u32(JSON長) + JSON(スカラー値と配列の一覧) + 配列の生バイト列。
+  // 保存時はgzip圧縮(使えるブラウザのみ)。サーバーは中身を解釈しない。
+  const SK = {
+    cpu: ["pc", "sr", "usp", "stopped", "irq"],
+    vdp: ["code", "addr", "pend", "first", "status", "dmaFill", "dmaLen"],
+    bus: ["zrst", "ctl", "dat", "cnt", "busreq", "bank"],
+    z80: ["f", "f2", "a2", "sp", "pc", "ix", "iy", "iff", "iff2", "im", "ri", "rr", "halt", "irq", "t", "cyc", "bank"],
+    ym:  ["addr", "part", "dac", "dacOn", "status", "ta", "tb", "ca", "cb", "mode", "l", "r"],
+    psg: ["tone", "vol", "cnt", "out", "lfsr", "latch"],
+  };
+  const objs = () => ({ cpu, vdp, bus, z80, ym: bus.ym, psg: bus.psg });
+
+  const stateArrays = () => ({
+    "cpu.d": cpu.d, "cpu.a": cpu.a,
+    "vdp.vram": vdp.vram, "vdp.cram": vdp.cram, "vdp.vsram": vdp.vsram, "vdp.reg": vdp.reg,
+    "bus.ram": bus.ram, "bus.z80": bus.z80, "bus.sram": bus.sram,
+    "z80.r": z80.r, "z80.s": z80.s,
+    "ym.reg0": bus.ym.reg[0], "ym.reg1": bus.ym.reg[1],
+    "ym.ph": bus.ym.ph, "ym.att": bus.ym.att, "ym.st": bus.ym.st, "ym.key": bus.ym.key, "ym.o1": bus.ym.o1,
+  });
+
+  function packState() {
+    const arrays = stateArrays();
+    const names = Object.keys(arrays);
+    const scalars = { hc };
+    const o = objs();
+    for (const [n, keys] of Object.entries(SK)) {
+      scalars[n] = {};
+      for (const k of keys) scalars[n][k] = o[n][k];
+    }
+    const head = new TextEncoder().encode(JSON.stringify({
+      v: 1, scalars,
+      arrays: names.map(k => [k, arrays[k].constructor.name, arrays[k].length]),
+    }));
+    const out = new Uint8Array(8 + head.length + names.reduce((n, k) => n + arrays[k].byteLength, 0));
+    out.set([0x47, 0x53, 0x56, 0x31]);
+    new DataView(out.buffer).setUint32(4, head.length, true);
+    out.set(head, 8);
+    let p = 8 + head.length;
+    for (const k of names) {
+      const a = arrays[k];
+      out.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), p);
+      p += a.byteLength;
+    }
+    return out;
+  }
+
+  function unpackState(u8) {
+    if (u8.length < 8 || u8[0] !== 0x47 || u8[1] !== 0x53 || u8[2] !== 0x56 || u8[3] !== 0x31) {
+      throw new Error("セーブの形式が違います");
+    }
+    const hl = new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getUint32(4, true);
+    if (8 + hl > u8.length) throw new Error("セーブが壊れています");
+    const head = JSON.parse(new TextDecoder().decode(u8.subarray(8, 8 + hl)));
+    if (head.v !== 1) throw new Error("未対応のバージョンです");
+
+    // 先に全部検証してから書き込む (途中で失敗しても現在の状態を壊さない)
+    const dst = stateArrays();
+    const plan = [];
+    let p = 8 + hl;
+    for (const [k, t, n] of head.arrays) {
+      const a = dst[k];
+      if (!a || a.constructor.name !== t || a.length !== n) throw new Error("互換性がありません");
+      if (p + a.byteLength > u8.length) throw new Error("セーブが壊れています");
+      plan.push([a, p]);
+      p += a.byteLength;
+    }
+    if (plan.length !== Object.keys(dst).length) throw new Error("互換性がありません");
+
+    for (const [a, off] of plan) {
+      new Uint8Array(a.buffer, a.byteOffset, a.byteLength).set(u8.subarray(off, off + a.byteLength));
+    }
+    // 許可したキーだけ反映する (想定外のプロパティは無視)
+    const o = objs();
+    for (const [n, keys] of Object.entries(SK)) {
+      const src = (head.scalars && head.scalars[n]) || {};
+      for (const k of keys) if (k in src) o[n][k] = src[k];
+    }
+    vdp.dmaFill = !!vdp.dmaFill;
+    vdp.dmaLen = vdp.dmaLen | 0;
+    hc = (head.scalars && head.scalars.hc) | 0;
+    bus.sdirty = !!bus.sramOn;
+  }
+
+  async function pipe(u8, stream) {
+    return new Uint8Array(await new Response(new Blob([u8]).stream().pipeThrough(stream)).arrayBuffer());
+  }
+  const gz = u8 => window.CompressionStream ? pipe(u8, new CompressionStream("gzip")) : Promise.resolve(u8);
+  async function gunz(u8) {
+    if (u8[0] === 0x1f && u8[1] === 0x8b) {
+      if (!window.DecompressionStream) throw new Error("このブラウザは圧縮セーブを読めません");
+      return pipe(u8, new DecompressionStream("gzip"));
+    }
+    return u8;
+  }
+
+  // ---------- クラウドセーブ ----------
+  // 手元で最後に同期したバージョンを覚えておき、別端末の更新と衝突したら確認する
+  const verKey = s => "genver:" + game + ":" + s;
+  const getVer = s => ls.get(verKey(s)) || "0";
+
+  async function cloudSave() {
+    if (!token || !game) return;
+    const slot = $("slot").value;
+    note("保存中…");
+    const body = await gz(packState());
+    const put = force => api("/saves/put?" + new URLSearchParams(Object.assign(
+      { game, slot, format: FORMAT, device: "web", base_version: getVer(slot) },
+      force ? { force: "1" } : {})), {
+      method: "POST", body, headers: { "Content-Type": "application/octet-stream" },
+    });
+    let res = await put(false);
+    let j = await res.json();
+    if (res.status === 409 && j.conflict) {
+      const s = j.server;
+      const info = s ? "(" + new Date(s.updated_at * 1000).toLocaleString() + (s.device ? " / " + s.device : "") + ")" : "";
+      if (!confirm("サーバーに別のセーブがあります" + info + "。上書きしますか?")) { note("キャンセルしました"); return; }
+      res = await put(true);
+      j = await res.json();
+    }
+    if (j.ok) {
+      ls.set(verKey(slot), j.save.version);
+      note("スロット" + slot + "に保存しました (v" + j.save.version + ", " + Math.round(j.save.size / 1024) + "KB)");
+    } else {
+      note("保存に失敗しました: " + (j.error || res.status));
+    }
+  }
+
+  async function cloudLoad() {
+    if (!token || !game) return;
+    const slot = $("slot").value;
+    note("読み込み中…");
+    const res = await api("/saves/get?" + new URLSearchParams({ game, slot }));
+    if (res.status === 404) { note("スロット" + slot + "にセーブがありません"); return; }
+    if (!res.ok) { note("読み込みに失敗しました (" + res.status + ")"); return; }
+    if (res.headers.get("X-Save-Format") !== FORMAT) { note("このセーブは未対応の形式です"); return; }
+    const ver = res.headers.get("X-Save-Version");
+    unpackState(await gunz(new Uint8Array(await res.arrayBuffer())));
+    ls.set(verKey(slot), ver);
+    running = true;
+    err = "";
+    vdp.renderFrame();
+    show();
+    note("スロット" + slot + "を読み込みました (v" + ver + ")");
+  }
+
+  // ---------- ログイン (デバイスコード方式) ----------
+  function updateButtons() {
+    $("csave").disabled = $("cload").disabled = !(token && game);
+  }
+
+  function setUser(u) {
+    $("login").hidden = !!u;
+    $("user").hidden = !u;
+    $("uname").textContent = u ? u.username : "";
+    if (!u && avaUrl) {
+      URL.revokeObjectURL(avaUrl);
+      avaUrl = "";
+      $("ava").removeAttribute("src");
+    }
+    updateButtons();
+  }
+
+  function setToken(t) {
+    token = t;
+    if (t) ls.set("gen_token", t); else ls.del("gen_token");
+    if (!t) { clearInterval(hb); setUser(null); }
+  }
+
+  async function loadAvatar() {
+    try {
+      const r = await api("/avatar?size=64");
+      if (!r.ok) return;
+      const url = URL.createObjectURL(await r.blob());
+      if (avaUrl) URL.revokeObjectURL(avaUrl);
+      avaUrl = url;
+      $("ava").src = url;
+    } catch (e) {}
+  }
+
+  async function refreshUser() {
+    if (!token) { setUser(null); return; }
+    try {
+      const r = await api("/me");
+      if (!r.ok) return;   // 401 は api() 内でログアウト処理済み
+      setUser((await r.json()).user);
+      loadAvatar();
+      startPresence();
+    } catch (e) {
+      note("ポータルに接続できません");
+    }
+  }
+
+  async function login() {
+    const dlg = $("dlg-login");
+    $("login-code").textContent = "…";
+    $("login-msg").textContent = "コードを発行しています";
+    $("login-link").hidden = true;
+    dlg.showModal();
+    const ctl = loginCtl = new AbortController();
+
+    let dc;
+    try {
+      dc = await (await fetch(API + "/device/code", { method: "POST" })).json();
+      if (!dc.ok) throw new Error();
+    } catch (e) {
+      $("login-msg").textContent = "ポータルに接続できません";
+      return;
+    }
+    $("login-code").textContent = dc.user_code;
+    try {
+      // 想定外のURLへ誘導されないよう、APIと同じオリジンのときだけリンクを出す
+      if (new URL(dc.verification_uri_complete).origin === new URL(API).origin) {
+        $("login-link").href = dc.verification_uri_complete;
+        $("login-link").hidden = false;
+      }
+    } catch (e) {}
+    $("login-msg").textContent = "承認を待っています…";
+
+    let wait = dc.interval * 1000;
+    const end = Date.now() + dc.expires_in * 1000;
+    while (!ctl.signal.aborted && Date.now() < end) {
+      await sleep(wait);
+      if (ctl.signal.aborted) return;
+      let j;
+      try {
+        const r = await fetch(API + "/device/token", {
+          method: "POST", body: new URLSearchParams({ device_code: dc.device_code }),
+        });
+        j = await r.json();
+      } catch (e) { continue; }
+
+      if (j.ok) {
+        setToken(j.token);
+        dlg.close();
+        note(j.user.username + " としてログインしました");
+        await refreshUser();
+        return;
+      }
+      if (j.error === "slow_down") wait += 5000;
+      else if (j.error !== "authorization_pending") {
+        $("login-msg").textContent = j.error === "access_denied" ? "拒否されました" : "コードの有効期限が切れました";
+        return;
+      }
+    }
+    if (!ctl.signal.aborted) $("login-msg").textContent = "コードの有効期限が切れました";
+  }
+
+  async function logout() {
+    try {
+      if (game) await api("/presence/stop", { method: "POST" });
+      await api("/logout", { method: "POST" });
+    } catch (e) {}
+    setToken("");
+    note("ログアウトしました");
+  }
+
+  // ---------- プレイ状況 ----------
+  const curState = () => document.hidden ? "paused" : "playing";
+
+  function presence(state) {
+    if (!token || !game) return;
+    api("/presence/update", {
+      method: "POST",
+      body: new URLSearchParams({
+        game, title, system: "Genesis", state, public: $("pub").checked ? "1" : "0",
+      }),
+    }).catch(() => {});
+  }
+
+  function startPresence() {
+    clearInterval(hb);
+    if (!token || !game) return;
+    presence(curState());
+    hb = setInterval(() => presence(curState()), 30000);   // サーバーは90秒でオフライン扱い
+  }
+
+  // ---------- 掲示板 ----------
+  async function bbs(path, opt) {
+    const out = $("bbs-out");
+    out.textContent = "読み込み中…";
+    try {
+      const r = await api(path, opt);
+      const j = await r.json();
+      out.textContent = j.ok ? j.body : (j.error || "エラー");   // textContentなのでHTMLは実行されない
+      return !!j.ok;
+    } catch (e) {
+      out.textContent = "ポータルに接続できません";
+      return false;
+    }
+  }
+  const bbsRead = () => bbs("/board/read?" + new URLSearchParams({ thread: $("bbs-thread").value.trim() }));
+
+  // ---------- イベント ----------
+  $("login").onclick = login;
+  $("logout").onclick = logout;
+  $("login-cancel").onclick = () => $("dlg-login").close();
+  $("dlg-login").addEventListener("close", () => { if (loginCtl) loginCtl.abort(); });
+
+  $("csave").onclick = () => cloudSave().catch(e => note("保存に失敗しました: " + e.message));
+  $("cload").onclick = () => cloudLoad().catch(e => note("読み込みに失敗しました: " + e.message));
+
+  $("pub").checked = ls.get("gen_pub") !== "0";
+  $("pub").onchange = () => { ls.set("gen_pub", $("pub").checked ? "1" : "0"); presence(curState()); };
+
+  $("bbs").onclick = () => {
+    if (!token) { note("掲示板を使うにはログインしてください"); return; }
+    $("dlg-bbs").showModal();
+    bbs("/board/threads");
+  };
+  $("bbs-list").onclick = () => bbs("/board/threads");
+  $("bbs-read").onclick = bbsRead;
+  $("bbs-close").onclick = () => $("dlg-bbs").close();
+  $("bbs-post").onclick = async () => {
+    const message = $("bbs-msg").value.trim();
+    if (!message) return;
+    if (await bbs("/board/post", { method: "POST",
+        body: new URLSearchParams({ thread: $("bbs-thread").value.trim(), message }) })) {
+      $("bbs-msg").value = "";
+      bbsRead();
+    }
+  };
+
+  document.addEventListener("visibilitychange", () => presence(curState()));
+  // タブを閉じたら即オフラインにする (sendBeaconはヘッダを付けられないのでtokenをボディで送る)
+  addEventListener("pagehide", () => {
+    if (token && game) navigator.sendBeacon(API + "/presence/stop", new URLSearchParams({ token }));
+  });
+
+  setUser(null);
+  refreshUser();
+
+  return {
+    romId, romTitle,
+    onRomLoaded(id, t) { game = id; title = t; updateButtons(); startPresence(); },
+    _pack: packState, _unpack: unpackState,   // テスト用
+  };
+})();
 
 frame();
 </script>
